@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { serializeDates } from "./datetime";
 import { AppError } from "./errors";
 
 /**
@@ -20,9 +21,13 @@ export interface ApiEnvelope<T> {
 }
 
 export function ok<T>(data?: T, meta?: ApiEnvelope<T>["meta"], status = 200): NextResponse {
-  return NextResponse.json({ success: true, data, meta } satisfies ApiEnvelope<T>, {
-    status,
-  });
+  // 出口统一把 Date 序列化为北京时间（+08:00 偏移）ISO 字符串，见 ./datetime.ts。
+  const body: ApiEnvelope<unknown> = {
+    success: true,
+    data: data === undefined ? undefined : serializeDates(data),
+    meta,
+  };
+  return NextResponse.json(body, { status });
 }
 
 export function okCreated<T>(data: T): NextResponse {

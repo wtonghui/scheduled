@@ -219,7 +219,7 @@ curl -X POST http://localhost:3000/api/v1/tokens \
     "revokedAt": null,
     "lastUsedAt": null,
     "expiresAt": null,
-    "createdAt": "2026-08-24T08:34:51.219Z"
+    "createdAt": "2026-08-24T16:34:51.219+08:00"
 } }
 ```
 
@@ -248,9 +248,9 @@ curl http://localhost:3000/api/v1/tokens \
     "name": "dev2",
     "scopes": ["tasks:read", "tasks:write", "tokens:manage"],
     "revokedAt": null,
-    "lastUsedAt": "2026-08-24T08:34:51.007Z",
+    "lastUsedAt": "2026-08-24T16:34:51.007+08:00",
     "expiresAt": null,
-    "createdAt": "2026-08-24T01:22:48.421Z"
+    "createdAt": "2026-08-24T09:22:48.421+08:00"
 } ], "meta": { "page": 1, "pageSize": 20, "total": 1 } }
 ```
 
@@ -347,10 +347,10 @@ curl -X POST http://localhost:3000/api/v1/tasks \
     "recipients": ["ops@example.com"],
     "notifyOn": ["succeeded", "failed"],
     "webhookUrl": "https://example.com/webhook/scheduler",
-    "nextRunAt": "2026-08-24T17:00:00.000Z",
+    "nextRunAt": "2026-08-25T01:00:00.000+08:00",
     "version": 1,
-    "createdAt": "2026-08-24T08:17:28.181Z",
-    "updatedAt": "2026-08-24T08:17:28.181Z",
+    "createdAt": "2026-08-24T16:17:28.181+08:00",
+    "updatedAt": "2026-08-24T16:17:28.181+08:00",
     "writable": true
 } }
 ```
@@ -391,8 +391,8 @@ curl "http://localhost:3000/api/v1/tasks?page=1&pageSize=20&enabled=true" \
   { "id": "cmt6yqpo50003m0vispoa9p9h", "name": "ERP 每日对账", "cron": "0 1 * * *", "scheduleIntervalSeconds": null,
     "taskType": "http", "payload": { "url": "http://127.0.0.1:3000/api/v1/healthz", "method": "GET" },
     "enabled": true, "maxAttempts": 3, "timeoutMs": 30000, "recipients": ["ops@example.com"],
-    "notifyOn": ["succeeded", "failed"], "webhookUrl": null, "nextRunAt": "2026-08-24T17:00:00.000Z",
-    "version": 1, "createdAt": "2026-08-24T08:17:28.181Z", "updatedAt": "2026-08-24T08:17:28.181Z", "writable": true }
+    "notifyOn": ["succeeded", "failed"], "webhookUrl": null, "nextRunAt": "2026-08-25T01:00:00.000+08:00",
+    "version": 1, "createdAt": "2026-08-24T16:17:28.181+08:00", "updatedAt": "2026-08-24T16:17:28.181+08:00", "writable": true }
 ], "meta": { "page": 1, "pageSize": 20, "total": 1 } }
 ```
 
@@ -435,8 +435,8 @@ curl -X PATCH http://localhost:3000/api/v1/tasks/cmt6yqpo50003m0vispoa9p9h \
     "payload": { "url": "http://127.0.0.1:3000/api/v1/healthz", "method": "GET", "params": { "source": "nightly" }, "headers": { "Accept": "application/json" }, "body": null },
     "enabled": true, "maxAttempts": 5, "timeoutMs": 30000,
     "recipients": ["ops@example.com"], "notifyOn": ["succeeded", "failed"], "webhookUrl": "https://example.com/webhook/scheduler",
-    "nextRunAt": "2026-08-24T17:00:00.000Z", "version": 2,
-    "createdAt": "2026-08-24T08:17:28.181Z", "updatedAt": "2026-08-24T08:17:28.603Z", "writable": true
+    "nextRunAt": "2026-08-25T01:00:00.000+08:00", "version": 2,
+    "createdAt": "2026-08-24T16:17:28.181+08:00", "updatedAt": "2026-08-24T16:17:28.603+08:00", "writable": true
 } }
 ```
 
@@ -491,9 +491,9 @@ curl "http://localhost:3000/api/v1/executions?page=1&pageSize=20" \
 ```json
 { "success": true, "data": [
   { "id": "cmt6yqq590004m0vicmnkz8fc", "taskId": "cmt6yqpo50003m0vispoa9p9h",
-    "scheduledAt": "2026-08-24T08:17:28.792Z", "startedAt": "2026-08-24T08:17:32.025Z", "finishedAt": "2026-08-24T08:17:32.073Z",
+    "scheduledAt": "2026-08-24T16:17:28.792+08:00", "startedAt": "2026-08-24T16:17:32.025+08:00", "finishedAt": "2026-08-24T16:17:32.073+08:00",
     "status": "succeeded", "attempt": 1, "durationMs": 48, "error": null, "trigger": "manual",
-    "createdAt": "2026-08-24T08:17:28.797Z" }
+    "createdAt": "2026-08-24T16:17:28.797+08:00" }
 ], "meta": { "page": 1, "pageSize": 20, "total": 1 } }
 ```
 
@@ -554,7 +554,7 @@ curl "http://localhost:3000/api/v1/email-log?page=1&pageSize=20" \
 
 - **二选一强校验**：`cron` 与 `scheduleIntervalSeconds` 必须恰好一个非空，否则 `400`。
 - **cron**：5 段 `分 时 日 月 周`，默认按 **Asia/Shanghai** 解析（支持透传其他 IANA 时区）。
-- **时间基准**：调度比较按 UTC 自洽（数据库连接强制 `timezone=Z`）；`nextRunAt` 等一律返回 UTC ISO 8601。
+- **时间基准**：调度与存储按 UTC 自洽（数据库连接强制 `timezone=Z`）；REST 返回的时间字段一律为带 `+08:00` 偏移的 ISO 8601（北京时间），如 `2026-08-25T10:00:00.000+08:00`，前端 `new Date()` 可直接无损解析。
 - **不补跑**：worker 停机错过的运行**不会补执行**，只推进到下一次未来触发（不填历史账）。
 - **重试**：`maxAttempts` 为同一次调度内的重试；超时（`timeoutMs`）与失败会重试到终态。
 
@@ -569,8 +569,8 @@ curl "http://localhost:3000/api/v1/email-log?page=1&pageSize=20" \
   "runId": "exXXXX...",
   "taskId": "tkXXXX...",
   "status": "succeeded",
-  "startedAt": "2026-08-24T01:00:00.120Z",
-  "finishedAt": "2026-08-24T01:00:01.040Z",
+  "startedAt": "2026-08-24T09:00:00.120+08:00",
+  "finishedAt": "2026-08-24T09:00:01.040+08:00",
   "durationMs": 920,
   "error": null,
   "result": null

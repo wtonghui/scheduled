@@ -60,7 +60,7 @@ export function TaskCompleteEmail(props: TaskCompleteEmailProps) {
               <strong>Task</strong>: <code>{taskId}</code>
             </Text>
             <Text>
-              <strong>Scheduled</strong>: {new Date(scheduledAt).toISOString()}
+              <strong>Scheduled</strong>: {scheduledAt}
             </Text>
             {durationMs != null && (
               <Text>
@@ -75,7 +75,10 @@ export function TaskCompleteEmail(props: TaskCompleteEmailProps) {
           </Section>
           <Hr />
           <Text style={{ fontSize: 12, color: "#666" }}>
-            <a href={`${appBaseUrl}/tasks/${taskId}`}>查看详情</a> · Scheduled Task Manager
+            <a target="_blank" href={`${appBaseUrl}/tasks/${taskId}`} rel="noreferrer">
+              查看详情
+            </a>{" "}
+            · Scheduled Task Manager
           </Text>
         </Container>
       </Body>

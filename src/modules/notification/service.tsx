@@ -1,10 +1,11 @@
-import { render } from "@react-email/render";
+import { config } from "@/lib/config";
+import { toBeijingIso } from "@/lib/datetime";
 import { prisma } from "@/lib/db";
 import { logger } from "@/lib/logger";
-import { config } from "@/lib/config";
 import { TaskCompleteEmail } from "@/mail/emails/TaskCompleteEmail";
 import { buildWebhookPayload } from "@/modules/webhook/service";
 import type { Prisma } from "@prisma/client";
+import { render } from "@react-email/render";
 
 /**
  * 终态通知（FR-008/FR-009/FR-016）：
@@ -50,7 +51,7 @@ export async function renderTaskEmail(summary: RunSummary): Promise<{
     status: summary.status === "succeeded" ? ("succeeded" as const) : ("failed" as const),
     taskId: summary.taskId,
     runId: summary.executionId,
-    scheduledAt: summary.scheduledAt.toISOString(),
+    scheduledAt: toBeijingIso(summary.scheduledAt),
     durationMs: summary.durationMs,
     errorMessage: summary.errorMessage ?? null,
     appBaseUrl: config.APP_BASE_URL,
@@ -104,9 +105,9 @@ export async function enqueueNotificationsFromRun(
         taskId: ctx.taskId,
         taskName: ctx.taskName,
         status: summary.status,
-        scheduledAt: summary.scheduledAt.toISOString(),
-        startedAt: summary.startedAt?.toISOString() ?? null,
-        finishedAt: summary.finishedAt?.toISOString() ?? null,
+        scheduledAt: toBeijingIso(summary.scheduledAt),
+        startedAt: summary.startedAt ? toBeijingIso(summary.startedAt) : null,
+        finishedAt: summary.finishedAt ? toBeijingIso(summary.finishedAt) : null,
         durationMs: summary.durationMs,
         ...(summary.errorMessage ? { error: { message: summary.errorMessage } } : {}),
       });

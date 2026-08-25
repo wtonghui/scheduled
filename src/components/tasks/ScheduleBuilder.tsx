@@ -313,9 +313,7 @@ export default function ScheduleBuilder({ onChange, defaultValue }: Props) {
               <Badge tone="neutral">下次运行</Badge>
               {next ? (
                 <>
-                  <code className="text-xs">
-                    {next.toISOString().replace("T", " ").slice(0, 19)} UTC
-                  </code>
+                  <code className="text-xs">{next.toLocaleString()}</code>
                   <span className="text-[12px] text-text-muted">
                     （约 {Math.round(((next.getTime() - Date.now()) / 3600000) * 10) / 10} 小时后）
                   </span>

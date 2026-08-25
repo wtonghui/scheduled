@@ -158,7 +158,7 @@ export default function TaskDetailPage() {
     ["计划", <code key="cron">{task.cron ?? "—"}</code>],
     [
       "下次运行",
-      <code key="next">{task.nextRunAt ? new Date(task.nextRunAt).toISOString() : "—"}</code>,
+      <code key="next">{task.nextRunAt ? new Date(task.nextRunAt).toLocaleString() : "—"}</code>,
     ],
     ["重试上限", String(task.maxAttempts)],
     ["超时", `${task.timeoutMs}ms`],
