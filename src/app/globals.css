@@ -1,0 +1,97 @@
+/* Tailwind v4 入口 + 浅色主题设计令牌（琥珀品牌强调） */
+@import "tailwindcss";
+
+@theme {
+  /* ─── 表面 ─── */
+  --color-bg: #f6f7f9; /* 页面背景 */
+  --color-surface: #ffffff; /* 卡片 / 面板 */
+  --color-surface-hover: #eef0f4; /* 行 hover */
+  --color-surface-sunken: #e8ebf0; /* 代码 / pre 内嵌 */
+
+  /* ─── 边框 ─── */
+  --color-line: #e2e6ec;
+  --color-line-strong: #c9d1dc; /* 输入框边框 / 强调分隔 */
+
+  /* ─── 文本 ─── */
+  --color-text: #16181d;
+  --color-text-secondary: #3d4452;
+  --color-text-muted: #6c7482;
+  --color-text-faint: #9aa3af;
+
+  /* ─── 品牌强调（琥珀） ─── */
+  --color-accent: #e89b1f;
+  --color-accent-hover: #d98a10;
+  --color-accent-fg: #1a1408; /* 琥珀按钮上的深色文字 */
+  --color-accent-soft: #fdf1dd; /* 新建 token 提示卡底 */
+
+  /* ─── 语义 ─── */
+  --color-ok: #1c8a5b;
+  --color-ok-soft: #e4f5ec;
+  --color-warn: #b3741a;
+  --color-warn-soft: #fbf0dd;
+  --color-bad: #d0332b;
+  --color-bad-soft: #fdeceb;
+  --color-info: #2b6cb0;
+  --color-info-soft: #e8f1fb;
+
+  /* ─── focus ring = 琥珀 ─── */
+  --color-ring: #d9920f;
+
+  /* ─── 圆角 ─── */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-pill: 999px;
+
+  /* ─── 字体 ─── */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei",
+    sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "SF Mono", "JetBrains Mono", Menlo, Consolas,
+    monospace;
+}
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+    background: var(--color-bg);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  a {
+    color: var(--color-info);
+    text-decoration: none;
+  }
+  a:hover {
+    text-decoration: underline;
+  }
+  code,
+  .mono {
+    font-family: var(--font-mono);
+  }
+  /* 键盘可达性：全局 focus-visible 环 */
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 1px;
+  }
+}
+
+/* toast 滑入动画（Radix Toast viewport 内） */
+@keyframes toast-slide-in {
+  from {
+    transform: translateY(8px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}

@@ -1,0 +1,283 @@
+import type { Prisma } from "@prisma/client";
+import { prisma } from "@/lib/db";
+import { withTimeout } from "@/lib/concurrency";
+import { classifyError, jitteredDelayMs } from "@/lib/retry";
+import { TimeoutError, HttpError } from "@/lib/errors";
+import { logger } from "@/lib/logger";
+import {
+  enqueueNotificationsFromRun,
+  type NotifyContext,
+  type RunSummary,
+} from "@/modules/notification/service";
+import {
+  taskRunsTotal,
+  taskAttemptsTotal,
+  taskDurationMs,
+  taskInFlight,
+  deadLetterTotal,
+} from "@/lib/metrics";
+import { getExecutor, type TaskExecutorInput } from "./registry";
+
+/**
+ * 执行生命周期（data-model.md 状态转移、FR-006/FR-007）。
+ * 每次重试 = 新执行行（attempt 递增）；幂等键含 attempt 防重复领取。
+ * 成功 → succeeded；可重试耗尽 → dead；永久错误 → failed。
+ * 终态在**同一事务**写入 email_log / webhook_delivery outbox（FR-008/FR-016）。
+ */
+
+export interface RunTaskDefinition {
+  id: string;
+  taskType: "http" | "noop";
+  payload: Record<string, unknown>;
+  payloadSecrets: Uint8Array | null;
+  timeoutMs: number;
+  maxAttempts: number;
+  tenantId: string;
+  taskName: string;
+  recipients: string[];
+  notifyOn: string[];
+  webhookUrl: string | null;
+  webhookSecret: Uint8Array | null;
+}
+
+export interface RunOutcome {
+  executionId: string;
+  status: "succeeded" | "failed" | "timeout" | "dead";
+}
+
+async function createExecution(
+  taskId: string,
+  idempotencyKey: string,
+  scheduledAt: Date,
+  attempt: number,
+  trigger: "scheduled" | "manual",
+) {
+  try {
+    return await prisma.taskExecution.create({
+      data: { taskId, idempotencyKey, scheduledAt, attempt, trigger, status: "pending" },
+    });
+  } catch (error) {
+    // 并发重复领取 → 幂等复用既有行
+    if ((error as { code?: string }).code === "P2002") {
+      const existing = await prisma.taskExecution.findUnique({ where: { idempotencyKey } });
+      if (existing) {
+        return existing;
+      }
+    }
+    throw error;
+  }
+}
+
+function serializeError(error: unknown): Prisma.InputJsonValue {
+  const err = error as { message?: string; status?: number; code?: string } | null;
+  return {
+    class: error instanceof TimeoutError ? "timeout" : error instanceof HttpError ? "http" : "error",
+    message: err?.message ?? String(error),
+    ...(typeof err?.status === "number" ? { status: err.status } : {}),
+    ...(typeof err?.code === "string" ? { code: err.code } : {}),
+  };
+}
+
+interface FinalizeFields {
+  status: "succeeded" | "failed" | "timeout" | "dead";
+  startedAt: Date;
+  finishedAt: Date;
+  durationMs: number;
+  error?: Prisma.InputJsonValue;
+}
+
+/** 终态更新 + 通知 outbox 同一事务（run_id 唯一幂等）。 */
+async function finalizeExecution(
+  executionId: string,
+  fields: FinalizeFields,
+  task: RunTaskDefinition,
+  scheduledAt: Date,
+  errorMessage: string | null,
+): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    await tx.taskExecution.update({
+      where: { id: executionId },
+      data: {
+        status: fields.status,
+        startedAt: fields.startedAt,
+        finishedAt: fields.finishedAt,
+        durationMs: fields.durationMs,
+        ...(fields.error !== undefined ? { error: fields.error } : {}),
+      },
+    });
+
+    // 防御：缺省通知上下文（测试/手工构造定义时）→ 不通知、不报错
+    const notifyCtx: NotifyContext = {
+      tenantId: task.tenantId ?? "",
+      taskId: task.id,
+      taskName: task.taskName ?? task.id,
+      recipients: task.recipients ?? [],
+      notifyOn: task.notifyOn ?? [],
+      webhookUrl: task.webhookUrl ?? null,
+      webhookSecretBytes: task.webhookSecret ?? null,
+    };
+    const summary: RunSummary = {
+      executionId,
+      taskId: task.id,
+      taskName: task.taskName,
+      status: fields.status === "succeeded" ? "succeeded" : "failed",
+      scheduledAt,
+      startedAt: fields.startedAt,
+      finishedAt: fields.finishedAt,
+      durationMs: fields.durationMs,
+      errorMessage: errorMessage ?? null,
+    };
+    await enqueueNotificationsFromRun(notifyCtx, summary, tx);
+  });
+}
+
+export async function runTaskWithScheduledAt(
+  task: RunTaskDefinition,
+  scheduledAt: Date,
+  trigger: "scheduled" | "manual",
+  opts: { executionId?: string } = {},
+): Promise<RunOutcome> {
+  const executor = getExecutor(task.taskType);
+  const input: TaskExecutorInput = {
+    task: {
+      id: task.id,
+      taskType: task.taskType,
+      payload: task.payload,
+      payloadSecrets: task.payloadSecrets,
+      timeoutMs: task.timeoutMs,
+    },
+    attempt: 1,
+    signal: new AbortController().signal,
+  };
+
+  for (let attempt = 1; attempt <= task.maxAttempts; attempt += 1) {
+    const key = `${task.id}:${scheduledAt.toISOString()}:a${attempt}`;
+
+    const execution =
+      opts.executionId && attempt === 1
+        ? await prisma.taskExecution.findUnique({ where: { id: opts.executionId } })
+        : await createExecution(task.id, key, scheduledAt, attempt, trigger);
+
+    if (!execution) {
+      throw new Error(`manual execution ${opts.executionId} not found`);
+    }
+    if (
+      execution.status === "succeeded" ||
+      execution.status === "failed" ||
+      execution.status === "dead" ||
+      execution.status === "timeout"
+    ) {
+      // 幂等命中：复用既有终态（并发重复领取场景）
+      return { executionId: execution.id, status: execution.status } as RunOutcome;
+    }
+
+    const startedAt = new Date();
+    taskInFlight.inc();
+    await prisma.taskExecution.update({ where: { id: execution.id }, data: { status: "running" } });
+
+    try {
+      await withTimeout((signal) => executor({ ...input, attempt, signal }), task.timeoutMs);
+      taskAttemptsTotal.inc({ status: "succeeded" });
+      taskRunsTotal.inc({ status: "succeeded" });
+      await finalizeExecution(
+        execution.id,
+        {
+          status: "succeeded",
+          startedAt,
+          finishedAt: new Date(),
+          durationMs: Date.now() - startedAt.getTime(),
+        },
+        task,
+        scheduledAt,
+        null,
+      );
+      return { executionId: execution.id, status: "succeeded" };
+    } catch (error) {
+      const finishedAt = new Date();
+      const terminal = terminalStatusOf(error);
+      const errorJson = serializeError(error);
+
+      const verdict = classifyError(error);
+      if (verdict === "permanent") {
+        taskAttemptsTotal.inc({ status: "failed" });
+        taskRunsTotal.inc({ status: "failed" });
+        await finalizeExecution(
+          execution.id,
+          {
+            status: terminal,
+            startedAt,
+            finishedAt,
+            durationMs: finishedAt.getTime() - startedAt.getTime(),
+            error: errorJson,
+          },
+          task,
+          scheduledAt,
+          (error as Error).message,
+        );
+        logger.warn(
+          { task_id: task.id, attempt, err: (error as Error).message },
+          "task failed permanently",
+        );
+        return { executionId: execution.id, status: "failed" };
+      }
+
+      if (attempt < task.maxAttempts) {
+        const delayMs = jitteredDelayMs(1000, 2, 30000, attempt - 1);
+        logger.info({ task_id: task.id, attempt, delayMs }, "task attempt failed, will retry");
+        taskAttemptsTotal.inc({ status: terminal });
+        await prisma.taskExecution.update({
+          where: { id: execution.id },
+          data: {
+            status: terminal,
+            startedAt,
+            finishedAt,
+            durationMs: finishedAt.getTime() - startedAt.getTime(),
+            error: errorJson,
+          },
+        });
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        continue;
+      }
+
+      // 重试耗尽 → 死信（终态事务写 outbox）
+      taskAttemptsTotal.inc({ status: terminal });
+      taskRunsTotal.inc({ status: "dead" });
+      deadLetterTotal.inc({ task_id: task.id });
+      await finalizeExecution(
+        execution.id,
+        {
+          status: "dead",
+          startedAt,
+          finishedAt,
+          durationMs: finishedAt.getTime() - startedAt.getTime(),
+          error: errorJson,
+        },
+        task,
+        scheduledAt,
+        (error as Error).message,
+      );
+      logger.error(
+        {
+          task_id: task.id,
+          attempt,
+          max_attempts: task.maxAttempts,
+          err: (error as Error).message,
+        },
+        "task dead-lettered after max attempts",
+      );
+      return { executionId: execution.id, status: "dead" };
+    } finally {
+      taskInFlight.dec();
+      taskDurationMs.observe(Date.now() - startedAt.getTime());
+    }
+  }
+
+  throw new Error("unreachable: runTaskWithScheduledAt loop");
+}
+
+function terminalStatusOf(error: unknown): "failed" | "timeout" {
+  if (error instanceof TimeoutError) {
+    return "timeout";
+  }
+  return "failed";
+}

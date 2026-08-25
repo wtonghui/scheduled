@@ -1,0 +1,643 @@
+# 接口文档
+
+> 供外部系统把「定时任务能力」接到本平台。端点前缀 `api/v1`，响应统一信封（错误码见 [§6](#envelope)）。**接口清单里每个接口都有一行真实、可直接粘贴运行的 curl**；字段细节在各小节。
+
+<Note>
+
+**接入前确认**：平台默认用于内网，任务目标地址与回调用例多为内网地址，请确认服务端已设置 `SSRF_ALLOW_PRIVATE=true` / `SSRF_ALLOW_LOCALHOST=true`（元数据主机名等结构性检查始终保留）。系统为多租户：所有资源按调用方 token 的租户隔离，跨租户一律 `404`。
+
+</Note>
+
+<Warn>
+
+**本文示例使用真实可用 token `sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt`（含 `tokens:manage`）**，明文展示于本页——请勿外发本页链接或截图。若需更换，全局替换该 token 即可。
+
+</Warn>
+
+<h2 id="quickstart">1 · 快速开始</h2>
+
+最小闭环：创建任务 → 查执行结果。本文示例统一用下列真实 token 与地址（前端开发可直接照抄）：
+
+```bash
+HOST=http://localhost:3000
+TOKEN=sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt
+```
+
+**① 创建任务**（未签发过 token 的，管理员可用 `tokens:manage` 签发，见第 2 节）
+
+```bash
+curl -X POST http://localhost:3000/api/v1/tasks \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "ERP 每日对账",
+    "cron": "0 1 * * *",
+    "taskType": "http",
+    "enabled": true,
+    "maxAttempts": 3,
+    "timeoutMs": 30000,
+    "recipients": ["ops@example.com"],
+    "notifyOn": ["succeeded", "failed"],
+    "webhookUrl": "https://example.com/webhook/scheduler",
+    "payload": {
+      "url": "http://127.0.0.1:3000/api/v1/healthz",
+      "method": "GET",
+      "params": { "source": "nightly" },
+      "headers": { "Accept": "application/json" },
+      "body": null
+    }
+  }'
+```
+
+响应 `201` 返回含 `id` / `version` / `nextRunAt` 的任务资源。完整字段与成功/失败响应见 [创建任务](#ep-tasks-create)。
+
+**② 查执行结果**
+
+```bash
+curl "http://localhost:3000/api/v1/executions?page=1&pageSize=20" \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+`data[]` 每项是一次运行，终态 `succeeded / failed`。字段与成功/失败响应见 [执行结果](#ep-executions)。
+
+<h2 id="auth">2 · 鉴权与 Token</h2>
+
+- **请求头**：除「接口清单」里「公共」分组的 4 个端点外，所有请求带 `x-api-token: <sche-…>`。
+- **token 形态**：`sche-` 前缀 + 48 位；DB 仅存 SHA-256 哈希，`timingSafeEqual` 常数时间比对；**明文仅创建时返回一次**。
+- **scope**：token 携带能力声明，缺失即拒绝：
+
+| Scope | 能力 |
+|-------|------|
+| `tasks:read` | 查看任务、执行历史、邮件/Webhook 投递日志 |
+| `tasks:write` | 创建 / 修改 / 删除任务、立即运行 |
+| `tokens:manage` | 签发 / 吊销 token（管理员专属） |
+
+- **错误语义**：`401` token 缺失/无效/已吊销；`403` scope 不足（`missing scope: <name>`）；跨租户访问他人资源 → `404`。完整错误码表见 [§6](#envelope)。
+
+管理员签发 / 吊销 token、自查凭证（真实示例）：
+
+```bash
+# 签发（返回的 data.token 明仅此一次，务必保存）
+curl -X POST http://localhost:3000/api/v1/tokens \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"erp-integration","scopes":["tasks:read","tasks:write"]}'
+
+# 列表
+curl http://localhost:3000/api/v1/tokens \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+
+# 吊销
+curl -X DELETE http://localhost:3000/api/v1/tokens/<token-id> \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+
+# 自查当前凭证（任意有效 token 可调）
+curl http://localhost:3000/api/v1/tokens/whoami \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+<h2 id="endpoints">3 · 核心接口</h2>
+
+### 接口清单（每一行都是真实可用的 curl）
+
+| 分组 | 方法 | 路径 | 调用示例 | 所需 Scope |
+|------|------|------|----------|-----------|
+| 公共 | <Method method="GET" /> | `/api/v1/healthz` | `curl http://localhost:3000/api/v1/healthz` | 无 |
+| 公共 | <Method method="GET" /> | `/api/v1/readyz` | `curl http://localhost:3000/api/v1/readyz` | 无 |
+| 公共 | <Method method="GET" /> | `/api/v1/metrics` | `curl http://localhost:3000/api/v1/metrics` | 无 |
+| 公共 | <Method method="GET" /> | `/api/v1/docs` | `curl http://localhost:3000/api/v1/docs` | 无 |
+| 管理 | <Method method="POST" /> | `/api/v1/tokens` | `curl -X POST http://localhost:3000/api/v1/tokens -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt" -H "Content-Type: application/json" -d '{"name":"my-app","scopes":["tasks:read","tasks:write"]}'` | `tokens:manage` |
+| 管理 | <Method method="GET" /> | `/api/v1/tokens` | `curl http://localhost:3000/api/v1/tokens -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"` | `tokens:manage` |
+| 管理 | <Method method="DELETE" /> | `/api/v1/tokens/:id` | `curl -X DELETE http://localhost:3000/api/v1/tokens/<token-id> -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"` | `tokens:manage` |
+| 管理 | <Method method="GET" /> | `/api/v1/tokens/whoami` | `curl http://localhost:3000/api/v1/tokens/whoami -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"` | 任意有效 token |
+| 任务 | <Method method="POST" /> | `/api/v1/tasks` | `curl -X POST http://localhost:3000/api/v1/tasks -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt" -H "Content-Type: application/json" -d '{"name":"每日对账","cron":"0 1 * * *","taskType":"http","payload":{"url":"http://127.0.0.1:3000/api/v1/healthz","method":"GET"},"recipients":["ops@example.com"]}'` | `tasks:write` |
+| 任务 | <Method method="GET" /> | `/api/v1/tasks` | `curl "http://localhost:3000/api/v1/tasks?page=1&pageSize=20" -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"` | `tasks:read` |
+| 任务 | <Method method="GET" /> | `/api/v1/tasks/:id` | `curl http://localhost:3000/api/v1/tasks/<task-id> -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"` | `tasks:read` |
+| 任务 | <Method method="PATCH" /> | `/api/v1/tasks/:id` | `curl -X PATCH http://localhost:3000/api/v1/tasks/<task-id> -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt" -H "Content-Type: application/json" -d '{"version":1,"enabled":false}'` | `tasks:write` |
+| 任务 | <Method method="DELETE" /> | `/api/v1/tasks/:id` | `curl -X DELETE http://localhost:3000/api/v1/tasks/<task-id> -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"` | `tasks:write` |
+| 任务 | <Method method="POST" /> | `/api/v1/tasks/:id/run-now` | `curl -X POST http://localhost:3000/api/v1/tasks/<task-id>/run-now -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"` | `tasks:write` |
+| 结果 | <Method method="GET" /> | `/api/v1/tasks/:id/executions` | `curl "http://localhost:3000/api/v1/tasks/<task-id>/executions?status=failed" -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"` | `tasks:read` |
+| 结果 | <Method method="GET" /> | `/api/v1/executions` | `curl "http://localhost:3000/api/v1/executions?page=1&pageSize=20" -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"` | `tasks:read` |
+| 结果 | <Method method="GET" /> | `/api/v1/tasks/:id/webhook-deliveries` | `curl http://localhost:3000/api/v1/tasks/<task-id>/webhook-deliveries -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"` | `tasks:read` |
+| 结果 | <Method method="GET" /> | `/api/v1/email-log` | `curl "http://localhost:3000/api/v1/email-log?status=delivered" -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"` | `tasks:read` |
+
+<Note>
+
+接口清单只是索引；每个接口的**完整参数、真实调用、成功/失败返回值**见下方按接口分的小节（粗下边框分隔）。占位符 `<task-id>` / `<token-id>` 用「创建/签发时返回的 id」替换。
+
+</Note>
+
+### 公共 · 无需鉴权
+
+<Endpoint id="ep-healthz" method="GET" path="/api/v1/healthz" name="存活探针（不查依赖）" />
+
+**参数**：无
+
+**调用**
+
+```bash
+curl http://localhost:3000/api/v1/healthz
+```
+
+**成功（200，实测）**：`{ "status": "ok" }`　**失败**：无
+
+<Endpoint id="ep-readyz" method="GET" path="/api/v1/readyz" name="就绪探针（DB / 邮件）" />
+
+**参数**：无
+
+```bash
+curl http://localhost:3000/api/v1/readyz
+```
+
+**成功（200）**：`data` 为 `db` / `mail` 检查结果（全就绪）。
+
+**失败（503，实测：本机邮件 provider 未就绪）**
+
+```json
+{ "success": false, "error": { "code": "NOT_READY", "message": "not ready", "details": [ { "db": "ok", "mail": "fail" } ] } }
+```
+
+<Endpoint id="ep-metrics" method="GET" path="/api/v1/metrics" name="Prometheus 指标（text/plain）" />
+
+**参数**：无
+
+```bash
+curl http://localhost:3000/api/v1/metrics
+```
+
+**成功（200，实测首行）**
+
+```text
+# HELP process_cpu_user_seconds_total Total user CPU time spent in seconds.
+# TYPE process_cpu_user_seconds_total counter
+process_cpu_user_seconds_total 0.015
+```
+
+**失败**：无
+
+<Endpoint id="ep-docs" method="GET" path="/api/v1/docs" name="OpenAPI 3 自描述文档" />
+
+**参数**：无
+
+```bash
+curl http://localhost:3000/api/v1/docs
+```
+
+**成功（200）**：OpenAPI 3 JSON（体量大，浏览器直接打开查看）。　**失败**：无
+
+### 管理 · token（需 `tokens:manage`）
+
+<Endpoint id="ep-tokens-create" method="POST" path="/api/v1/tokens" name="签发 token（明文仅此一次）" />
+
+**参数**（请求体）
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `name` | string | 否 | 用途备注 |
+| `scopes` | string[] | 否 | 能力：`tasks:read` / `tasks:write` / `tokens:manage` |
+| `expiresAt` | string | 否 | 过期时间（ISO 8601）；空为永不过期 |
+
+**调用**
+
+```bash
+curl -X POST http://localhost:3000/api/v1/tokens \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"erp-integration","scopes":["tasks:read","tasks:write"]}'
+```
+
+**成功（201，实测）**
+
+```json
+{ "success": true, "data": {
+    "id": "cmt6zd2hf0005m0via9u5g4er",
+    "token": "sche-…（明文仅此一次，请立即保存）",
+    "prefix": "sche-ige",
+    "lastFour": "tJpP",
+    "name": "doc-example",
+    "scopes": ["tasks:read"],
+    "revokedAt": null,
+    "lastUsedAt": null,
+    "expiresAt": null,
+    "createdAt": "2026-08-24T08:34:51.219Z"
+} }
+```
+
+**失败（403，实测：用只含 `tasks:read` 的 token 调用）**
+
+```json
+{ "success": false, "error": { "code": "FORBIDDEN", "message": "missing scope: tokens:manage" } }
+```
+
+<Endpoint id="ep-tokens-list" method="GET" path="/api/v1/tokens" name="token 列表" />
+
+**参数**：无
+
+```bash
+curl http://localhost:3000/api/v1/tokens \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（200，实测）**
+
+```json
+{ "success": true, "data": [ {
+    "id": "cmt6jxgbp00001gvinetstwfw",
+    "prefix": "sche-sfB",
+    "lastFour": "cMKt",
+    "name": "dev2",
+    "scopes": ["tasks:read", "tasks:write", "tokens:manage"],
+    "revokedAt": null,
+    "lastUsedAt": "2026-08-24T08:34:51.007Z",
+    "expiresAt": null,
+    "createdAt": "2026-08-24T01:22:48.421Z"
+} ], "meta": { "page": 1, "pageSize": 20, "total": 1 } }
+```
+
+**失败（403）**：`{ "error": { "code": "FORBIDDEN", "message": "missing scope: tokens:manage" } }`
+
+<Endpoint id="ep-tokens-revoke" method="DELETE" path="/api/v1/tokens/:id" name="吊销 token（立即失效）" />
+
+**参数**：路径 `:id` = token 的 id（签发/列表返回）
+
+```bash
+curl -X DELETE http://localhost:3000/api/v1/tokens/cmt6zd2hf0005m0via9u5g4er \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（204，无响应体）**：吊销后该 token 立即失效，幂等。
+**失败**：`404` 不存在；`403` 缺 `tokens:manage`。
+
+<Endpoint id="ep-whoami" method="GET" path="/api/v1/tokens/whoami" name="当前凭证自查（任意有效 token）" />
+
+**参数**：无
+
+```bash
+curl http://localhost:3000/api/v1/tokens/whoami \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（200，实测）**
+
+```json
+{ "success": true, "data": {
+    "prefix": "sche-sfB", "lastFour": "cMKt",
+    "scopes": ["tasks:read", "tasks:write", "tokens:manage"], "expiresAt": null
+} }
+```
+
+**失败（401，实测：无 token）**
+
+```json
+{ "success": false, "error": { "code": "UNAUTHORIZED", "message": "missing x-api-token" } }
+```
+
+### 任务 · tasks（写 `tasks:write` / 读 `tasks:read`）
+
+<Endpoint id="ep-tasks-create" method="POST" path="/api/v1/tasks" name="创建任务" />
+
+**参数**（请求体，zod 校验）
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `name` | string | 是 | ≤191 字符 |
+| `cron` | string | 二选一 | 5 段 cron（默认 Asia/Shanghai 解析） |
+| `scheduleIntervalSeconds` | int | 二选一 | 固定间隔 ≥1s；与 `cron` 恰好填一个 |
+| `taskType` | string | 否 | `http` / `noop`，默认 `http` |
+| `payload` | object | http 时必填 | 见下方 `payload` 表 |
+| `enabled` | boolean | 否 | 默认 `true` |
+| `maxAttempts` | int | 否 | 1–10，默认 `3`（同次调度内重试） |
+| `timeoutMs` | int | 否 | 1000–3_600_000，默认 `30000` |
+| `recipients` | string[] | 是 | ≥1 个合法邮箱（终态邮件通知） |
+| `notifyOn` | string[] | 否 | 触发通知的终态，默认 `["succeeded","failed"]` |
+| `webhookUrl` | string | 否 | 终态回调地址（`secret` 系统生成） |
+
+`payload`（taskType=http）结构
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `url` | string | 是 | 合法 URL；创建时经 SSRF 校验 |
+| `method` | string | 否 | `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`HEAD`，默认 `GET` |
+| `params` | object | 否 | URL query 键值，执行时并入 url，同名覆盖 |
+| `headers` | object | 否 | 请求头，key → string |
+| `body` | string | 否 | 原始请求体字符串（非 JSON 对象） |
+
+**调用**
+
+```bash
+curl -X POST http://localhost:3000/api/v1/tasks \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"ERP 每日对账","cron":"0 1 * * *","taskType":"http","enabled":true,"maxAttempts":3,"timeoutMs":30000,"recipients":["ops@example.com"],"notifyOn":["succeeded","failed"],"webhookUrl":"https://example.com/webhook/scheduler","payload":{"url":"http://127.0.0.1:3000/api/v1/healthz","method":"GET","params":{"source":"nightly"},"headers":{"Accept":"application/json"},"body":null}}'
+```
+
+**成功（201，实测）**
+
+```json
+{ "success": true, "data": {
+    "id": "cmt6yqpo50003m0vispoa9p9h",
+    "name": "ERP 每日对账",
+    "cron": "0 1 * * *",
+    "scheduleIntervalSeconds": null,
+    "taskType": "http",
+    "payload": { "url": "http://127.0.0.1:3000/api/v1/healthz", "method": "GET", "params": { "source": "nightly" }, "headers": { "Accept": "application/json" }, "body": null },
+    "enabled": true,
+    "maxAttempts": 3,
+    "timeoutMs": 30000,
+    "recipients": ["ops@example.com"],
+    "notifyOn": ["succeeded", "failed"],
+    "webhookUrl": "https://example.com/webhook/scheduler",
+    "nextRunAt": "2026-08-24T17:00:00.000Z",
+    "version": 1,
+    "createdAt": "2026-08-24T08:17:28.181Z",
+    "updatedAt": "2026-08-24T08:17:28.181Z",
+    "writable": true
+} }
+```
+
+**失败（400，实测：缺 `payload` / `recipients`）**
+
+```json
+{ "success": false, "error": { "code": "VALIDATION", "message": "invalid task input",
+  "details": ["payload: Invalid input: expected nonoptional, received undefined",
+              "recipients: Invalid input: expected array, received undefined"] } }
+```
+
+**401（实测：无 token）**：`{ "success": false, "error": { "code": "UNAUTHORIZED", "message": "missing x-api-token" } }`
+
+<Endpoint id="ep-tasks-list" method="GET" path="/api/v1/tasks" name="任务列表" />
+
+**参数**（查询参数）
+
+| 字段 | 说明 |
+|------|------|
+| `page` / `pageSize` | 分页，默认 1 / 20（max 100） |
+| `enabled` | `true` / `false` 筛选 |
+| `taskType` | `http` / `noop` |
+| `q` | 关键字 |
+| `mine` / `owner` | 只看同租户 / 只看本人 token（控制台用） |
+
+**调用**
+
+```bash
+curl "http://localhost:3000/api/v1/tasks?page=1&pageSize=20&enabled=true" \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（200，实测；每项含 payload 明文）**
+
+```json
+{ "success": true, "data": [
+  { "id": "cmt6yqpo50003m0vispoa9p9h", "name": "ERP 每日对账", "cron": "0 1 * * *", "scheduleIntervalSeconds": null,
+    "taskType": "http", "payload": { "url": "http://127.0.0.1:3000/api/v1/healthz", "method": "GET" },
+    "enabled": true, "maxAttempts": 3, "timeoutMs": 30000, "recipients": ["ops@example.com"],
+    "notifyOn": ["succeeded", "failed"], "webhookUrl": null, "nextRunAt": "2026-08-24T17:00:00.000Z",
+    "version": 1, "createdAt": "2026-08-24T08:17:28.181Z", "updatedAt": "2026-08-24T08:17:28.181Z", "writable": true }
+], "meta": { "page": 1, "pageSize": 20, "total": 1 } }
+```
+
+**失败**：匿名只读可浏览（未登录时 `writable: false`），需完整视图请带 token。
+
+<Endpoint id="ep-tasks-detail" method="GET" path="/api/v1/tasks/:id" name="任务详情" />
+
+**参数**：路径 `:id`
+
+```bash
+curl http://localhost:3000/api/v1/tasks/cmt6yqpo50003m0vispoa9p9h \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（200，实测；结构同创建响应）**：含全量字段 + `payload` 明文可见。
+
+**失败（404，实测：任务不存在）**
+
+```json
+{ "success": false, "error": { "code": "NOT_FOUND", "message": "task not found" } }
+```
+
+<Endpoint id="ep-tasks-update" method="PATCH" path="/api/v1/tasks/:id" name="修改任务（乐观并发）" />
+
+**参数**：可更新字段子集（`name` / `cron` / `scheduleIntervalSeconds` / `taskType` / `payload` / `enabled` / `maxAttempts` / `timeoutMs` / `recipients` / `notifyOn` / `webhookUrl`）+ **`version` 必填**（当前最新值，冲突返回 409）
+
+```bash
+curl -X PATCH http://localhost:3000/api/v1/tasks/cmt6yqpo50003m0vispoa9p9h \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt" \
+  -H "Content-Type: application/json" \
+  -d '{"version":1,"name":"ERP 每日对账（已修改）","enabled":true,"maxAttempts":5}'
+```
+
+**成功（200，实测；`version` 1→2）**
+
+```json
+{ "success": true, "data": {
+    "id": "cmt6yqpo50003m0vispoa9p9h", "name": "ERP 每日对账（已修改）",
+    "cron": "0 1 * * *", "scheduleIntervalSeconds": null, "taskType": "http",
+    "payload": { "url": "http://127.0.0.1:3000/api/v1/healthz", "method": "GET", "params": { "source": "nightly" }, "headers": { "Accept": "application/json" }, "body": null },
+    "enabled": true, "maxAttempts": 5, "timeoutMs": 30000,
+    "recipients": ["ops@example.com"], "notifyOn": ["succeeded", "failed"], "webhookUrl": "https://example.com/webhook/scheduler",
+    "nextRunAt": "2026-08-24T17:00:00.000Z", "version": 2,
+    "createdAt": "2026-08-24T08:17:28.181Z", "updatedAt": "2026-08-24T08:17:28.603Z", "writable": true
+} }
+```
+
+**失败（409，实测：`version` 过期）**
+
+```json
+{ "success": false, "error": { "code": "VERSION_CONFLICT", "message": "task was modified concurrently" } }
+```
+
+<Endpoint id="ep-tasks-delete" method="DELETE" path="/api/v1/tasks/:id" name="删除任务" />
+
+**参数**：路径 `:id`；有在途运行会拒绝（`409 RUN_IN_FLIGHT`），等其终态后再删
+
+```bash
+curl -X DELETE http://localhost:3000/api/v1/tasks/cmt6yqpo50003m0vispoa9p9h \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（204，无响应体）**：硬删除，执行记录一并移除。
+**失败（404）**：`{ "error": { "code": "NOT_FOUND", "message": "task not found" } }`；**409**：`{ "error": { "code": "RUN_IN_FLIGHT", ... } }`
+
+<Endpoint id="ep-tasks-run-now" method="POST" path="/api/v1/tasks/:id/run-now" name="立即运行一次" />
+
+**参数**：路径 `:id`（无请求体）
+
+```bash
+curl -X POST http://localhost:3000/api/v1/tasks/cmt6yqpo50003m0vispoa9p9h/run-now \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（202，实测；入队后异步执行）**
+
+```json
+{ "success": true, "data": { "executionId": "cmt6yqq590004m0vicmnkz8fc", "status": "pending" } }
+```
+
+**失败（404 / 401）**：同删除/详情。
+
+### 结果 · 只读（需 `tasks:read`）
+
+<Endpoint id="ep-executions" method="GET" path="/api/v1/executions" name="全局执行历史" />
+
+**参数**（查询）：`page` / `pageSize` / `status` / `taskId`（按任务过滤）
+
+```bash
+curl "http://localhost:3000/api/v1/executions?page=1&pageSize=20" \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（200，实测一项）**
+
+```json
+{ "success": true, "data": [
+  { "id": "cmt6yqq590004m0vicmnkz8fc", "taskId": "cmt6yqpo50003m0vispoa9p9h",
+    "scheduledAt": "2026-08-24T08:17:28.792Z", "startedAt": "2026-08-24T08:17:32.025Z", "finishedAt": "2026-08-24T08:17:32.073Z",
+    "status": "succeeded", "attempt": 1, "durationMs": 48, "error": null, "trigger": "manual",
+    "createdAt": "2026-08-24T08:17:28.797Z" }
+], "meta": { "page": 1, "pageSize": 20, "total": 1 } }
+```
+
+**字段说明**：`status`：`queued → running → succeeded / failed`；`trigger`：`scheduled` / `manual`；`error`：失败时为对象（`class`/`status`/`message`），成功 `null`。
+
+**失败（401 / 403）**：`missing x-api-token` / `missing scope: tasks:read`。
+
+<Endpoint id="ep-executions-task" method="GET" path="/api/v1/tasks/:id/executions" name="单任务执行历史" />
+
+**参数**（查询）：`page` / `pageSize` / `status`；路径 `:id`
+
+```bash
+curl "http://localhost:3000/api/v1/tasks/cmt6yqpo50003m0vispoa9p9h/executions?status=succeeded" \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（200）**：结构同全局接口（`data[]` 字段同上）。
+**失败（404）**：`{ "error": { "code": "NOT_FOUND", "message": "task not found" } }`
+
+<Endpoint id="ep-webhook-deliveries" method="GET" path="/api/v1/tasks/:id/webhook-deliveries" name="Webhook 投递历史" />
+
+**参数**：路径 `:id`
+
+```bash
+curl http://localhost:3000/api/v1/tasks/cmt6yqpo50003m0vispoa9p9h/webhook-deliveries \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（200，实测：尚未配置/未触发时为空列表）**
+
+```json
+{ "success": true, "data": [], "meta": { "page": 1, "pageSize": 20, "total": 0 } }
+```
+
+有投递记录时 `data[]` 项：`{ "runId", "status", "attempts", "responseCode", "sentAt", "lastError" }`。
+
+**失败（404 / 401）**：同任务详情。
+
+<Endpoint id="ep-email-log" method="GET" path="/api/v1/email-log" name="邮件投递日志" />
+
+**参数**（查询）：`runId` / `status` / `page` / `pageSize`
+
+```bash
+curl "http://localhost:3000/api/v1/email-log?page=1&pageSize=20" \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（200）**：`data[]` 项：`{ "runId", "toAddress", "subject", "status", "attempts", "messageId", "sentAt", "lastError" }` + `meta`。
+**失败**：`401` / `403`；注：当前环境实测返回 `500 INTERNAL`（疑与本机邮件配置有关）。
+
+<Note>
+
+列表/详情/执行历史支持匿名只读（浏览器控制台行为，仅显示已启用概览）。**外部系统对接请始终携带 token**。
+
+</Note>
+
+<h2 id="schedule">4 · 调度参数</h2>
+
+- **二选一强校验**：`cron` 与 `scheduleIntervalSeconds` 必须恰好一个非空，否则 `400`。
+- **cron**：5 段 `分 时 日 月 周`，默认按 **Asia/Shanghai** 解析（支持透传其他 IANA 时区）。
+- **时间基准**：调度比较按 UTC 自洽（数据库连接强制 `timezone=Z`）；`nextRunAt` 等一律返回 UTC ISO 8601。
+- **不补跑**：worker 停机错过的运行**不会补执行**，只推进到下一次未来触发（不填历史账）。
+- **重试**：`maxAttempts` 为同一次调度内的重试；超时（`timeoutMs`）与失败会重试到终态。
+
+<h2 id="notification">5 · 结果通知</h2>
+
+### 5.1 Webhook 回调 <Method method="POST" /> `webhookUrl`（推荐）
+
+任务到终态且 `notifyOn` 包含该状态时，平台向 `webhookUrl` 发起 `POST`，请求体：
+
+```json
+{
+  "runId": "exXXXX...",
+  "taskId": "tkXXXX...",
+  "status": "succeeded",
+  "startedAt": "2026-08-24T01:00:00.120Z",
+  "finishedAt": "2026-08-24T01:00:01.040Z",
+  "durationMs": 920,
+  "error": null,
+  "result": null
+}
+```
+
+请求头带签名：`X-Scheduled-Signature: t=<unix 秒>,v1=<hex>`。**验签算法**：对 `t + "." + 原始请求体` 做 HMAC-SHA256，密钥为任务的 `webhookSecret`；`t` 防重放（默认容忍 5 分钟偏差），`v1` 防伪造。
+
+<Warn>
+
+**`webhookSecret` 目前不在任何 API 响应中返回**（创建任务时由平台内部生成，仅用于出站签名）。需要在你的服务端验签的话，请让平台管理员提供该任务的密钥填入下方示例；否则只能校验时间窗口，无法验证签名来源。
+
+</Warn>
+
+Node 验签示例：
+
+```ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const secret = "<webhookSecret>"; // 由平台管理员提供（当前 API 不返回该值）
+const MAX_AGE_SECONDS = 300;
+
+function verify(body: string, header: string | undefined): boolean {
+  const m = /^t=(\d+),v1=([0-9a-f]{64})$/i.exec(header ?? "");
+  if (!m) return false;
+  const t = Number(m[1]);
+  if (Math.abs(Date.now() / 1000 - t) > MAX_AGE_SECONDS) return false; // 防重放
+  const expected = createHmac("sha256", secret)
+    .update(`${t}.`)
+    .update(body)
+    .digest("hex");
+  return timingSafeEqual(Buffer.from(m[2], "hex"), Buffer.from(expected, "hex"));
+}
+```
+
+<Danger>
+
+**必须验签**：`t` 防重放、`v1` 防伪造。未验签的回调请求不可信，不应据其触发业务动作。
+
+</Danger>
+
+投递语义：按 `runId` 幂等（同一运行只成功投递一次）；失败走指数退避自动重试；记录查 `GET /api/v1/tasks/:id/webhook-deliveries`。
+
+### 5.2 邮件通知
+
+配置 `recipients` + `notifyOn` 后终态自动发邮件；投递记录查 `GET /api/v1/email-log`（可按 `runId` / `status` 过滤）。
+
+<h2 id="envelope">6 · 响应信封与错误码</h2>
+
+```json
+{ "success": true, "data": { ... }, "meta": { "page": 1, "pageSize": 20, "total": 42 } }
+{ "success": false, "error": { "code": "VALIDATION", "message": "...", "details": ["..."] } }
+```
+
+| code | HTTP | 含义 |
+|------|------|------|
+| `VALIDATION` | 400 | 请求体 / 参数校验失败 |
+| `UNAUTHORIZED` | 401 | token 缺失、无效或已吊销 |
+| `FORBIDDEN` | 403 | 不具备所需 scope（`missing scope: <name>`） |
+| `NOT_FOUND` | 404 | 资源不存在（含跨租户访问） |
+| `VERSION_CONFLICT` | 409 | PATCH `version` 与库中不一致 |
+| `RUN_IN_FLIGHT` | 409 | 存在在途运行，不可删除 |
+| `INTERNAL` | 500 | 服务端内部错误 |
+
+分页：`page` ≥ 1，`pageSize` 1–100（默认 20）；`meta` 恒为 `{ page, pageSize, total }`。
+
+<h2 id="appendix">7 · 附录</h2>
+
+- 机器可读规范：运行中的平台 `/api/v1/docs`（OpenAPI 3 JSON）。
+- 完整契约：仓库 `specs/001-scheduled-tasks/contracts/api.md`。

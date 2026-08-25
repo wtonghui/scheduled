@@ -1,0 +1,24 @@
+# ─────────────────────────────────────────────────────────────
+# 生产 compose：单个应用容器，容器内 PM2 守护 web + worker 双进程。
+# 数据库 = 已有独立 MySQL（经 .env.production 的 DATABASE_URL 连接，不随 compose 起库）。
+# 入口 = 直接暴露端口（web 容器 3000 → 宿主 8080），由外部网关/反代负责转发。
+# ─────────────────────────────────────────────────────────────
+services:
+  scheduled:
+    build: .
+    image: scheduled:latest
+    restart: unless-stopped
+    ports:
+      - "8080:3000"
+    env_file:
+      - .env.production
+    environment:
+      # next start / prisma migrate 需要生产模式；worker 亦以 production 模式运行
+      - NODE_ENV=production
+    healthcheck:
+      # 纯存活探针（/api/v1/healthz 不依赖依赖项；readyz 含 SMTP，用作文档化就绪验证）
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/v1/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s # 含 prisma migrate deploy + 双进程启动

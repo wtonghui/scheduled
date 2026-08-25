@@ -1,0 +1,30 @@
+# scheduled 项目的独立 MySQL 环境
+# 注意：宿主 3306 被本机 MySQL80 服务占用，容器映射到 13306
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: scheduled-mysql
+    restart: unless-stopped
+    environment:
+      # root 仅用于容器内运维，应用使用 scheduler 账号
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: scheduled
+      MYSQL_USER: scheduler
+      MYSQL_PASSWORD: changeme
+      # 固定容器时钟为上海时区（system_time_zone=CST → NOW() 返回 +08）。
+      # 与宿主一致可读，且 mariadb 驱动默认随服务器 SYSTEM 时区序列化 JS Date，两侧自动对齐。
+      TZ: Asia/Shanghai
+    ports:
+      - "13306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      # 不依赖账号鉴权，能响应即视为存活
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+volumes:
+  mysql_data:

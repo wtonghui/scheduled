@@ -1,0 +1,20 @@
+import "dotenv/config";
+
+/**
+ * Vitest 全局 setup：在各测试文件导入前设置最小测试环境变量。
+ * config.ts 在模块加载时解析 process.env 并 fail-fast，故必须在 import 前准备好。
+ * 先加载项目 .env（真实凭据），仅当缺失时填充测试值。
+ */
+process.env.NODE_ENV ??= "test";
+process.env.DATABASE_URL ??= "mysql://scheduler:changeme@127.0.0.1:13306/scheduled";
+
+// 32 字节 hex（64 字符）供 AES-256-GCM
+process.env.PAYLOAD_ENCRYPTION_KEY ??= "a".repeat(64);
+
+process.env.APP_BOOTSTRAP_TOKEN ??= "test-bootstrap-token-0123456789abcdef";
+process.env.TOKEN_PREFIX ??= "sche-";
+process.env.MAIL_PROVIDER ??= "json";
+process.env.LOG_LEVEL ??= "info";
+
+// 仅测试环境：允许 worker 调用本地测试 HTTP 服务器（生产默认关闭）
+process.env.SSRF_ALLOW_PRIVATE ??= "true";

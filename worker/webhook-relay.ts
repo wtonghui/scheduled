@@ -1,0 +1,99 @@
+import { prisma } from "../src/lib/db";
+import { HttpError } from "../src/lib/errors";
+import { classifyError, jitteredDelayMs } from "../src/lib/retry";
+import { checkUrlForSsrf } from "../src/lib/ssrf";
+import { decryptSecret } from "../src/lib/crypto";
+import { signWebhook } from "../src/modules/webhook/signature";
+import { logger } from "../src/lib/logger";
+
+/**
+ * Webhook 中继（FR-016 / contracts 投递契约）：
+ * 轮询 webhook_delivery(pending) → POST payload + `X-Scheduled-Signature: t/v1`。
+ * 2xx sent；429/5xx/超时重试；4xx 永久 failed；耗尽 dead。run_id 唯一幂等。
+ */
+
+export async function runWebhookRelayOnce(limit = 20): Promise<number> {
+  const now = new Date();
+  const rows = await prisma.webhookDelivery.findMany({
+    where: {
+      status: { in: ["pending"] },
+      OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+    },
+    orderBy: { id: "asc" },
+    take: limit,
+  });
+
+  let delivered = 0;
+  for (const row of rows) {
+    const claimed = await prisma.webhookDelivery.updateMany({
+      where: { id: row.id, status: "pending" },
+      data: { status: "in_progress" },
+    });
+    if (claimed.count === 0) {
+      continue;
+    }
+
+    try {
+      const ssrf = await checkUrlForSsrf(row.webhookUrl);
+      if (!ssrf.ok) {
+        throw new Error(`webhook url blocked: ${ssrf.reason}`);
+      }
+
+      // 复用签名前的原始 body，确保 HMAC 覆盖投递字节
+      const body = typeof row.payload === "string" ? row.payload : JSON.stringify(row.payload);
+      const secret = row.webhookSecret ? decryptSecret(new Uint8Array(row.webhookSecret)) : "";
+      const signature = signWebhook(body, secret);
+
+      const res = await fetch(row.webhookUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-scheduled-signature": signature,
+        },
+        body,
+      });
+
+      if (res.status >= 200 && res.status < 300) {
+        await prisma.webhookDelivery.update({
+          where: { id: row.id },
+          data: {
+            status: "sent",
+            sentAt: new Date(),
+            signature,
+            responseCode: res.status,
+            attempts: { increment: 1 },
+          },
+        });
+        delivered += 1;
+        continue;
+      }
+      if (res.status === 429 || res.status >= 500) {
+        throw new HttpError(res.status, `webhook responded ${res.status}`);
+      }
+      // 4xx → 永久失败
+      throw new HttpError(res.status, `webhook responded ${res.status} (permanent)`);
+    } catch (error) {
+      const attempts = row.attempts + 1;
+      const base = { attempts, lastError: (error as Error).message };
+      const permanent =
+        classifyError(error) === "permanent" || row.attempts + 1 >= row.maxAttempts;
+      if (permanent) {
+        await prisma.webhookDelivery.update({
+          where: { id: row.id },
+          data: { ...base, status: "dead" },
+        });
+        logger.error({ run_id: row.runId, attempts }, "webhook dead-lettered");
+      } else {
+        await prisma.webhookDelivery.update({
+          where: { id: row.id },
+          data: {
+            ...base,
+            status: "failed",
+            nextRetryAt: new Date(Date.now() + jitteredDelayMs(2000, 2, 60000, attempts - 1)),
+          },
+        });
+      }
+    }
+  }
+  return delivered;
+}
