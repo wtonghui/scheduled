@@ -1,14 +1,14 @@
 import http from "node:http";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import * as taskService from "../../src/modules/task/service";
-import { runTaskWithScheduledAt } from "../../src/modules/execution/service";
-import { registerDefaultExecutors } from "../../src/modules/execution/register";
-import { runEmailRelayOnce } from "../../worker/relay";
-import { runWebhookRelayOnce } from "../../worker/webhook-relay";
-import { verifyWebhook } from "../../src/modules/webhook/signature";
 import { decryptSecret } from "../../src/lib/crypto";
 import { prisma } from "../../src/lib/db";
-import { createTestTenant, createTestTask, createTestToken, cleanupTenant } from "./helpers";
+import { registerDefaultExecutors } from "../../src/modules/execution/register";
+import { runTaskWithScheduledAt } from "../../src/modules/execution/service";
+import * as taskService from "../../src/modules/task/service";
+import { verifyWebhook } from "../../src/modules/webhook/signature";
+import { runEmailRelayOnce } from "../../worker/relay";
+import { runWebhookRelayOnce } from "../../worker/webhook-relay";
+import { cleanupTenant, createTestTask, createTestTenant, createTestToken } from "./helpers";
 
 /**
  * US3 集成测试（T030）：邮件幂等、Webhook HMAC 签名+验签、outbox、中继幂等。
@@ -152,6 +152,37 @@ describe("notification outbox + relays", () => {
     expect(await runEmailRelayOnce(20)).toBe(0);
     expect(await runWebhookRelayOnce(20)).toBe(0);
     expect(webhookHits).toHaveLength(1);
+  });
+
+  it("notifyOn=[failed] → 成功运行零通知；失败运行邮件+webhook 均入 outbox", async () => {
+    const task = await taskService.create(tenantId, ownerTokenId, {
+      name: "notify-gated",
+      cron: "*/5 * * * *",
+      taskType: "http",
+      payload: { url: `${baseUrl}/ok`, method: "GET" },
+      recipients: ["ops@example.com"],
+      notifyOn: ["failed"],
+      webhookUrl: `${baseUrl}/hook`,
+    });
+
+    const def = await loadTaskDef(task.id);
+
+    // 成功：notifyOn 只订阅 failed → 邮件与 webhook 都不应产生
+    const okRun = await runTaskWithScheduledAt(def, new Date(), "scheduled");
+    expect(okRun.status).toBe("succeeded");
+    expect(await prisma.emailLog.count({ where: { runId: okRun.executionId } })).toBe(0);
+    expect(await prisma.webhookDelivery.count({ where: { runId: okRun.executionId } })).toBe(0);
+
+    // 失败（404 永久错误，单次即终态）：两类通知都应产生
+    const failingDef = { ...def, payload: { ...def.payload, url: `${baseUrl}/missing` } };
+    const badRun = await runTaskWithScheduledAt(failingDef, new Date(), "scheduled");
+    expect(badRun.status).toBe("failed");
+    expect(await prisma.emailLog.count({ where: { runId: badRun.executionId } })).toBe(1);
+    expect(await prisma.webhookDelivery.count({ where: { runId: badRun.executionId } })).toBe(1);
+
+    // 清场：把本用例的 outbox 投递到终态，避免残留 pending 行污染后续用例的全局中继计数
+    await runEmailRelayOnce(20);
+    await runWebhookRelayOnce(20);
   });
 
   it("retried run that succeeds → still exactly one email (run_id idempotent)", async () => {

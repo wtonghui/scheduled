@@ -34,7 +34,7 @@ docker compose up -d
 npm run prisma:generate
 npm run prisma:migrate   # migrate dev
 npm run prisma:deploy    # 生产迁移
-npm run seed             # 首个租户 + 引导 token + noop 冒烟任务
+npm run seed             # 首个租户 + 引导 token（幂等；不插入示例/冒烟任务）
 
 # 测试（见「测试」节）
 npm run test:unit        # vitest run tests/unit
@@ -61,7 +61,7 @@ npm run coverage
 `API route → modules/*/service → repository → Prisma`。业务模块在 `src/modules/`：
 - `task/` — DTO（zod）校验 → SSRF 检查 → 敏感字段加密 → 落库；`payload`（url/method 非敏感）与加密的 `payloadSecrets`（**params/headers/body**）**分开存储**。http payload 结构：`url` + `method`(GET/POST/PUT/PATCH/DELETE/HEAD) + `params`(URL query 键值对，执行时并入 url，原 query 保留、同名覆盖) + `headers` + `body`。任务落 `owner_token_id`（创建者 token，租户内按 token 隔离视图用；写权限仍按租户共享）。
 - `execution/` — 执行器按 `taskType` 注册（`register.ts` / `registry.ts`，当前 `http` / `noop`）；含超时、重试（maxAttempts）、状态机推进。
-- `notification/` — outbox 落库（`email_log` / `webhook_delivery`）+ 终态判定。
+- `notification/` — outbox 落库（`email_log` / `webhook_delivery`）+ 终态判定。`notifyOn` 是邮件与 webhook 的**统一**通知开关（2026-08-25 起 webhook 同受其约束，timeout/dead 按 failed 归类），勿只给邮件加判断。
 - `webhook/` — 出站签名 `X-Scheduled-Signature: t=<unix>,v1=<hmac>`。
 - `auth/`、`tenant/` — token 校验、引导租户。
 
@@ -70,14 +70,14 @@ npm run coverage
 ### 调度模型（`src/lib/cron.ts` + `worker/scheduler.ts`）
 
 - 调度方式二选一：`cron`（5/6 段，**默认按 Asia/Shanghai 解析**，`cron.ts` 可透传任意 IANA 时区）**或** `scheduleIntervalSeconds`（固定间隔），`isValidSchedule` 强制恰有一个非空。
-- Worker 每轮单事务：`SELECT ... FOR UPDATE SKIP LOCKED` 领取到期任务 → 写租约（`claimed_by` / `claimed_until`）→ 推进 `next_run_at`。
+- Worker 每轮单事务：`SELECT ... FOR UPDATE SKIP LOCKED`（**版本探测**：MySQL <8.0.1 / MariaDB <10.6 不支持时自动退化为「条件 UPDATE + 受影响行数」的可移植领取，多实例仍恰好一次）领取到期任务 → 写租约（`claimed_by` / `claimed_until`）→ 推进 `next_run_at`。
 - **重启不补跑**：`advanceMissedRuns` 只把错过的 `next_run_at` 推进到下一次未来运行；`reclaimExpiredLeases` 清扫过期租约。
 - 手动运行（`run-now`）：入队 `status='pending' AND trigger='manual'` 的执行行，由 worker 领取。
 - 乐观并发：`version` 字段，更新冲突 → 409。
 
 ### 鉴权（`src/modules/auth/`）
 
-- 全部非公开端点走 `x-api-token` 头；DB 仅存 SHA-256 哈希，`timingSafeEqual` 比对。
+- 全部非公开端点走 `x-api-token` 头；DB 仅存 SHA-256 哈希，`timingSafeEqual` 比对。**例外（单默认租户临时约定）**：`POST /api/v1/tokens` 签发免鉴权（不查头、不查 scope），token 归 default 租户（`createdBy: "anonymous"`）；多租户落地时恢复 `requireAuth({ scopes: ["tokens:manage"] })`，列表/吊销/自查仍走 `tokens:manage`。
 - `requireAuth({ scopes })` / `optionalAuth` 包装 route handler（`middleware.ts`）。scope 缺失 → **403 `missing scope: <name>`**；scope：`tasks:read` / `tasks:write` / `tokens:manage`。
 - 所有查询强制 `tenant_id`；跨租户一律 **404**。
 
@@ -104,7 +104,7 @@ outbox 表按 `run_id` UNIQUE；执行、邮件、Webhook 各自以 run_id 串�
 
 - **worker 进程生命周期**：`SKIP LOCKED` 只保证"多实例并发领取安全"，**不保证"旧代码被换掉"**。部署/重启后务必确认没有残留的旧 worker（non-watch 的 `npx tsx worker/index.ts`、PM2 旧实例、多个 dev 进程可能并存）——旧代码 worker 会继续领取并误停任务（2026-08-21 事故根因：一个 9:14 启动、非 watch 的 worker 一直跑修复前代码，把任务逐个停用）。
 - **时区约定（2026-08-24 起固定）**：容器 `TZ: Asia/Shanghai`（`docker exec` 看库为 +08），但**应用会话经 `DATABASE_URL?...&timezone=Z` 强制 UTC**——调度比较（`NOW()` 与写入的 `next_run_at`）一律按 UTC 自洽。原因：Prisma 7 driver-adapter 把 JS Date 序列化为 UTC 固化值、不受进程 TZ 影响，若与服务器时钟基准不同会差 8h；容器 +08 只是运维可见性。**裸 `mysql2` 默认 `timezone:'local'`，传 JS Date 产生 ±8h 偏移**（曾致恢复任务延后 8 小时才到期）——运维/恢复脚本请用 SQL 端时间（`DATE_ADD(NOW(), ...)`）或走 Prisma，不要裸 mysql2 传 Date。改连接串时勿删 `timezone=Z`。**对外时间戳契约（2026-08-25 起）**：存储保持 UTC，但 REST 响应、完成邮件、webhook payload 里的时间一律序列化为带 `+08:00` 偏移的 ISO 8601（北京时间）——REST 在 `api-envelope.ts` 的 `ok()` 经 `src/lib/datetime.ts`（luxon）收口，邮件/webhook 在 `notification/service.tsx` 用 `toBeijingIso`；前端 `toLocaleString()` 直接可用，勿在展示层再手写 UTC 转换。幂等键里的 `toISOString()` 是内部标识，勿改成带偏移格式。
-- **改 `worker/` 的调度/领取逻辑**：必须考虑 SKIP LOCKED 并发、租约超时回收、不补跑语义；改 schema 后跑 `prisma:generate` + `migrate`。
+- **改 `worker/` 的调度/领取逻辑**：必须考虑 SKIP LOCKED 并发（不支持时自动退化为条件 UPDATE 领取）、租约超时回收、不补跑语义；改 schema 后跑 `prisma:generate` + `migrate`。
 - **任务表单/回显**：任务只用 `cron` 字符串字段存储；结构化界面（`src/components/tasks/ScheduleBuilder.tsx` + `src/lib/schedule-builder.ts`）在前端做「结构化 spec ↔ cron 字符串」双向转换，编辑回显时同样在前端反解。
 - API 路由文件用 `@/`（→ `src`）与 `@worker`（→ `worker`）别名；import 别用相对路径跨大目录。
 - 错误模型：`src/lib/errors.ts` 的 `AppError` → HTTP 状态映射；统一走 `api-envelope` 响应格式，不要直接 `NextResponse.json` 裸返回。

@@ -1,10 +1,10 @@
 import http from "node:http";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { runTaskWithScheduledAt } from "../../src/modules/execution/service";
-import { claimDueTasks, advanceMissedRuns } from "../../worker/scheduler";
-import { registerDefaultExecutors } from "../../src/modules/execution/register";
 import { prisma } from "../../src/lib/db";
-import { createTestTenant, createTestTask, createTestToken, cleanupTenant } from "./helpers";
+import { registerDefaultExecutors } from "../../src/modules/execution/register";
+import { runTaskWithScheduledAt } from "../../src/modules/execution/service";
+import { advanceMissedRuns, claimDueTasks } from "../../worker/scheduler";
+import { cleanupTenant, createTestTask, createTestTenant, createTestToken } from "./helpers";
 
 /**
  * US2 集成测试（T024）：领取幂等(SKIP LOCKED)、重试、超时、重启不补跑、重叠允许。
@@ -22,6 +22,11 @@ function startServer(): Promise<string> {
       if (req.url?.startsWith("/ok")) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.url?.startsWith("/text")) {
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end("pong");
         return;
       }
       if (req.url?.startsWith("/retry")) {
@@ -107,6 +112,16 @@ describe("worker execution", () => {
     expect(requests[0]?.url).toBe("/ok");
   });
 
+  it("plain-text 2xx succeeds (non-JSON body must not fail the task)", async () => {
+    const task = await createTestTask(tenantId, { taskType: "noop" });
+    const outcome = await runTaskWithScheduledAt(
+      taskFor(task.id, { url: `${baseUrl}/text` }),
+      new Date(),
+      "scheduled",
+    );
+    expect(outcome.status).toBe("succeeded");
+  });
+
   it("http task merges payload.params into request query (keeps existing query)", async () => {
     const task = await createTestTask(tenantId, { taskType: "noop" });
     const outcome = await runTaskWithScheduledAt(
@@ -175,17 +190,34 @@ describe("worker execution", () => {
     const task = await createTestTask(tenantId, {
       nextRunAt: new Date(Date.now() - 5_000),
     });
-    const first = await claimDueTasks("worker-a", 60, 10);
+    const first = await claimDueTasks("worker-a", 60, 10, true);
     expect(first.some((c) => c.task.id === task.id)).toBe(true);
 
-    const second = await claimDueTasks("worker-b", 60, 10);
+    const second = await claimDueTasks("worker-b", 60, 10, true);
     expect(second.some((c) => c.task.id === task.id)).toBe(false);
 
     const row = await prisma.task.findUnique({ where: { id: task.id } });
     expect(row?.claimedBy).toBe("worker-a");
     expect(row?.claimedUntil).not.toBeNull();
     // next_run_at 已推进（晚于原始到期时间，不补跑当前）
-    expect(row?.nextRunAt?.getTime() ?? 0).toBeGreaterThan(task.nextRunAt!.getTime());
+    expect(row?.nextRunAt?.getTime() ?? 0).toBeGreaterThan(task.nextRunAt?.getTime() ?? 0);
+  });
+
+  it("claim is idempotent without SKIP LOCKED (portable fallback for MySQL <8/ MariaDB <10.6)", async () => {
+    // 强制走可移植路径（无 FOR UPDATE SKIP LOCKED，靠条件 UPDATE + affectedRows 判归属）
+    const task = await createTestTask(tenantId, {
+      nextRunAt: new Date(Date.now() - 5_000),
+    });
+    const first = await claimDueTasks("worker-b", 60, 10, false);
+    expect(first.some((c) => c.task.id === task.id)).toBe(true);
+
+    const second = await claimDueTasks("worker-a", 60, 10, false);
+    expect(second.some((c) => c.task.id === task.id)).toBe(false);
+
+    const row = await prisma.task.findUnique({ where: { id: task.id } });
+    expect(row?.claimedBy).toBe("worker-b");
+    expect(row?.claimedUntil).not.toBeNull();
+    expect(row?.nextRunAt?.getTime() ?? 0).toBeGreaterThan(task.nextRunAt?.getTime() ?? 0);
   });
 
   it("restart catch-up advances missed runs without executing them", async () => {

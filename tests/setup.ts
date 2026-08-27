@@ -13,6 +13,8 @@ process.env.PAYLOAD_ENCRYPTION_KEY ??= "a".repeat(64);
 
 process.env.APP_BOOTSTRAP_TOKEN ??= "test-bootstrap-token-0123456789abcdef";
 process.env.TOKEN_PREFIX ??= "sche-";
+// 集成测试强制 json 落盘（不真发）：.env 的 smtp/http 仅供本地手动联调，
+// 否则测试会向真实 SMTP 外发邮件——慢、依赖外部服务，还会触发服务商限流（2026-08-25 实锤）。
 process.env.MAIL_PROVIDER ??= "json";
 process.env.LOG_LEVEL ??= "info";
 

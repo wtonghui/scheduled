@@ -5,7 +5,7 @@
 ## 架构
 
 - **Web**（Next.js 16 App Router，`src/app`）：REST API `/api/v1/*` + 控制台 Web UI。
-- **Worker**（`worker/`，独立长驻进程）：轮询 MySQL 领取到期任务（`SELECT ... FOR UPDATE SKIP LOCKED` + 租约），有界异步并发（p-limit）执行，邮件/Webhook outbox 中继。
+- **Worker**（`worker/`，独立长驻进程）：轮询 MySQL 领取到期任务（`SELECT ... FOR UPDATE SKIP LOCKED` + 租约；数据库不支持时自动退化为可移植领取），有界异步并发（p-limit）执行，邮件/Webhook outbox 中继。
 - **DB**：MySQL 8，Prisma 7（driver adapter `@prisma/adapter-mariadb`）。表：`task` / `task_execution` / `email_log` / `webhook_delivery` / `api_token` / `tenant` / `worker_lease`。
 
 分层：API → service → repository → ORM；执行器按 `taskType` 注册（http/noop）；邮件挂 `MailService` 端口后。
@@ -13,7 +13,7 @@
 ## 快速开始（详见 `specs/001-scheduled-tasks/quickstart.md`）
 
 ```bash
-# 1. 依赖 + 迁移 + 种子（首个租户/管理 token/noop 冒烟任务）
+# 1. 依赖 + 迁移 + 种子（首个租户/管理 token，不含示例任务）
 npm install
 npx prisma migrate dev --name init
 npm run seed

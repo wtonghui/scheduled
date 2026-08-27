@@ -69,7 +69,7 @@ export const httpExecutor: TaskExecutor = async ({ task, signal, attempt }) => {
     fetchInit.body = String(bodyValue);
   }
 
-  for (; ;) {
+  for (;;) {
     let response: Response;
     try {
       response = await fetch(currentUrl, fetchInit);
@@ -101,9 +101,19 @@ export const httpExecutor: TaskExecutor = async ({ task, signal, attempt }) => {
     }
 
     if (response.status >= 200 && response.status < 300) {
-      const data = await response.json();
-      console.log("httpExecutor response data", { from: currentUrl, data: data.data });
-      return { result: { status: response.status, redirects, attempt, data: data.data } };
+      // 2xx 即成功：body 按 content-type 解析，非 JSON（或声明 JSON 却解析失败）保留原文。
+      // 此前无条件 response.json()，纯文本/空 body 的 2xx 会被 SyntaxError 误判为任务失败。
+      const raw = await response.text();
+      const contentType = response.headers.get("content-type") ?? "";
+      let data: unknown = raw;
+      if (contentType.includes("json")) {
+        try {
+          data = JSON.parse(raw) as unknown;
+        } catch {
+          // 解析失败保原文，仍按成功处理
+        }
+      }
+      return { result: { status: response.status, redirects, attempt, data } };
     }
 
     // 429 与 5xx → 可重试

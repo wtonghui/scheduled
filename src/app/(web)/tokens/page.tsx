@@ -16,7 +16,7 @@ import { useAuth } from "@/lib/auth-context";
 import { useCallback, useEffect, useState } from "react";
 
 /**
- * Token 管理控制台（contracts T1-T3）。敏感管理面，需登录。
+ * Token 管理控制台（contracts T1-T3）。签发免登录（单默认租户临时约定）；列表/吊销需登录。
  */
 
 interface TokenRow {
@@ -77,7 +77,7 @@ export default function TokensPage() {
       setCreated(res.data.token);
       setName("");
       setShowCreate(false);
-      load();
+      if (isAuthed) load();
       toast("token 已创建（明文仅显示一次）", "success");
     } catch (err) {
       setError(err instanceof ApiClientError ? `${err.status} ${err.message}` : String(err));
@@ -102,20 +102,11 @@ export default function TokensPage() {
     }
   };
 
-  if (!isAuthed) {
-    return (
-      <div>
-        <PageHeader title="API 令牌" />
-        <EmptyState title="请先登录" hint="Token 管理为敏感操作，请先在顶部登录。" />
-      </div>
-    );
-  }
-
   return (
     <div>
       <PageHeader
         title="API 令牌"
-        subtitle="明文仅创建时返回一次；数据库只存 SHA-256 哈希。用 APP_BOOTSTRAP_TOKEN 或管理 token 签发。"
+        subtitle="签发无需登录（单默认租户临时约定，明文仅返回一次）；列表与吊销需登录。数据库只存 SHA-256 哈希。"
         actions={
           <Button
             variant={showCreate ? "secondary" : "primary"}
@@ -187,7 +178,12 @@ export default function TokensPage() {
         </div>
       )}
 
-      {loading ? (
+      {!isAuthed ? (
+        <EmptyState
+          title="未登录"
+          hint="可匿名签发 token（上方「新建令牌」）；列表与吊销需登录后查看。"
+        />
+      ) : loading ? (
         <Card className="divide-y divide-line p-0">
           {SKELETON_ROWS.map((k) => (
             <div key={k} className="flex items-center gap-4 px-4 py-3">

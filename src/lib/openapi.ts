@@ -53,8 +53,14 @@ registry.registerPath({
   tags: ["tasks"],
   parameters: [pageParam, pageSizeParam, enabledParam, typeParam, qParam],
   responses: {
-    200: { description: "paginated tasks", content: { "application/json": { schema: SuccessAny } } },
-    401: { description: "unauthorized", content: { "application/json": { schema: ErrorEnvelope } } },
+    200: {
+      description: "paginated tasks",
+      content: { "application/json": { schema: SuccessAny } },
+    },
+    401: {
+      description: "unauthorized",
+      content: { "application/json": { schema: ErrorEnvelope } },
+    },
   },
 });
 
@@ -90,7 +96,10 @@ registry.registerPath({
   },
   responses: {
     201: { description: "created", content: { "application/json": { schema: SuccessAny } } },
-    400: { description: "validation error", content: { "application/json": { schema: ErrorEnvelope } } },
+    400: {
+      description: "validation error",
+      content: { "application/json": { schema: ErrorEnvelope } },
+    },
   },
 });
 
@@ -132,7 +141,10 @@ registry.registerPath({
   },
   responses: {
     200: { description: "updated", content: { "application/json": { schema: SuccessAny } } },
-    409: { description: "version conflict", content: { "application/json": { schema: ErrorEnvelope } } },
+    409: {
+      description: "version conflict",
+      content: { "application/json": { schema: ErrorEnvelope } },
+    },
   },
 });
 
@@ -211,7 +223,9 @@ registry.registerPath({
   path: "/api/v1/healthz",
   summary: "Liveness",
   tags: ["ops"],
-  responses: { 200: { description: "ok", content: { "application/json": { schema: SuccessAny } } } },
+  responses: {
+    200: { description: "ok", content: { "application/json": { schema: SuccessAny } } },
+  },
 });
 
 registry.registerPath({
@@ -238,7 +252,7 @@ registry.registerPath({
 registry.registerPath({
   method: "post",
   path: "/api/v1/tokens",
-  summary: "Create API token (tokens:manage)",
+  summary: "Create API token (temporary: no auth, single default tenant)",
   tags: ["tokens"],
   request: {
     body: {

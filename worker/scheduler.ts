@@ -2,12 +2,15 @@ import { Prisma } from "@prisma/client";
 import { createPool } from "../src/lib/concurrency";
 import { computeNextRun } from "../src/lib/cron";
 import { prisma } from "../src/lib/db";
+import { logger } from "../src/lib/logger";
 import type { RunTaskDefinition } from "../src/modules/execution/service";
 
 /**
  * 调度器（research.md §2 / FR-005/FR-014/FR-012）：
- * - 到期任务领取：单事务内 `SELECT ... FOR UPDATE SKIP LOCKED` + 租约 + 推进 next_run_at。
- * - 手动运行（run-now）领取：status='pending' AND trigger='manual' 的执行行（SKIP LOCKED）。
+ * - 到期任务领取：单事务内 `SELECT ... FOR UPDATE SKIP LOCKED`（服务器支持时）+ 租约 + 推进 next_run_at。
+ * - 低版本兼容：MySQL < 8.0.1 / MariaDB < 10.6 不支持 SKIP LOCKED，自动退化为
+ *   「条件 UPDATE + 受影响行数」的可移植领取（与 outbox 领取同一模式），多实例判定等价。
+ * - 手动运行（run-now）领取：status='pending' AND trigger='manual' 的执行行。
  * - 重启对账 + 租约回收（T038）。
  */
 
@@ -81,34 +84,92 @@ const TASK_COLUMNS = Prisma.sql`
   webhook_url AS webhookUrl, webhook_secret AS webhookSecret
 `;
 
-/** 领取到期任务 + 手动执行（单事务，SKIP LOCKED）。 */
+/** SKIP LOCKED 能力探测结果缓存（进程内仅探测一次）。 */
+let skipLockedSupportedCache: boolean | null = null;
+
+/**
+ * 服务器是否支持 `SELECT ... FOR UPDATE SKIP LOCKED`：
+ * MySQL ≥ 8.0.1 或 MariaDB ≥ 10.6 支持。探测失败时保守按"不支持"处理（可移植路径不影响正确性）。
+ */
+async function supportsSkipLocked(): Promise<boolean> {
+  if (skipLockedSupportedCache !== null) {
+    return skipLockedSupportedCache;
+  }
+  try {
+    const rows = (await prisma.$queryRaw(Prisma.sql`SELECT VERSION() AS version`)) as Array<{
+      version: string;
+    }>;
+    const version = rows[0]?.version ?? "";
+    const isMaria = /mariadb/i.test(version);
+    const [, majStr = "0", minStr = "0"] = /^(\d+)\.(\d+)/.exec(version) ?? [];
+    const major = Number(majStr);
+    const minor = Number(minStr);
+    const supported = isMaria
+      ? major > 10 || (major === 10 && minor >= 6)
+      : major > 8 || (major === 8 && minor >= 1);
+    skipLockedSupportedCache = supported;
+    logger.info({ version, skipLocked: supported }, "claim: sql capability probe");
+    return supported;
+  } catch (error) {
+    logger.warn({ err: error }, "claim: SKIP LOCKED probe failed; using portable claim sql");
+    skipLockedSupportedCache = false;
+    return false;
+  }
+}
+
+/** 到期任务候选查询：支持 SKIP LOCKED 时加锁跳过，否则不带（归属交由条件 UPDATE 判定）。 */
+function dueTasksSelectSql(batchSize: number, skipLocked: boolean): Prisma.Sql {
+  const tail = skipLocked ? Prisma.sql`FOR UPDATE SKIP LOCKED` : Prisma.sql``;
+  return Prisma.sql`
+    SELECT ${TASK_COLUMNS}
+    FROM task
+    WHERE enabled = 1 AND next_run_at <= NOW()
+      AND (claimed_until IS NULL OR claimed_until < NOW())
+    ORDER BY next_run_at ASC
+    LIMIT ${batchSize}
+    ${tail}
+  `;
+}
+
+/** 手动运行候选查询：同上。 */
+function pendingManualSelectSql(batchSize: number, skipLocked: boolean): Prisma.Sql {
+  const tail = skipLocked ? Prisma.sql`FOR UPDATE SKIP LOCKED` : Prisma.sql``;
+  return Prisma.sql`
+    SELECT te.id, te.scheduled_at AS scheduledAt, te.task_id AS taskId
+    FROM task_execution te
+    WHERE te.status = 'pending' AND te.trigger = 'manual'
+    ORDER BY te.created_at ASC
+    LIMIT ${batchSize}
+    ${tail}
+  `;
+}
+
+/**
+ * 领取到期任务 + 手动执行（单事务）。
+ * 服务器支持时用 `FOR UPDATE SKIP LOCKED`；低版本 MySQL/MariaDB 自动退化为
+ * 「条件 UPDATE + 受影响行数」判定归属（并发下抢不到的候选行直接跳过，多实例仍恰好一次）。
+ * @param skipLockedOverride 测试用：强制走/不走 SKIP LOCKED 路径；缺省探测服务器版本。
+ */
 export async function claimDueItems(
   workerId: string,
   leaseSeconds: number,
   batchSize: number,
+  skipLockedOverride?: boolean,
 ): Promise<ClaimItem[]> {
+  const skipLocked = skipLockedOverride ?? (await supportsSkipLocked());
   const items = await prisma.$transaction(async (tx) => {
     const items: ClaimItem[] = [];
 
     // 1) 到期任务
-    const due = (await tx.$queryRaw(
-      Prisma.sql`
-        SELECT ${TASK_COLUMNS}
-        FROM task
-        WHERE enabled = 1 AND next_run_at <= NOW()
-          AND (claimed_until IS NULL OR claimed_until < NOW())
-        ORDER BY next_run_at ASC
-        LIMIT ${batchSize}
-        FOR UPDATE SKIP LOCKED
-      `,
-    )) as DueRow[];
+    const due = (await tx.$queryRaw(dueTasksSelectSql(batchSize, skipLocked))) as DueRow[];
 
     for (const row of due) {
       const next = computeNextRun(
         { cron: row.cron, scheduleIntervalSeconds: row.scheduleIntervalSeconds },
         new Date(),
       );
-      await tx.$executeRaw(
+      // 归属判定：SKIP LOCKED 下持有行锁必命中；兼容路径下若已被别实例抢先，affectedRows=0 → 跳过。
+      const claimed = await tx.$executeRaw(
         Prisma.sql`
           UPDATE task
           SET claimed_by = ${workerId},
@@ -116,8 +177,12 @@ export async function claimDueItems(
               next_run_at = ${next},
               enabled = ${next ? 1 : 0}
           WHERE id = ${row.id}
+            AND (claimed_until IS NULL OR claimed_until < NOW())
         `,
       );
+      if (claimed === 0) {
+        continue;
+      }
       items.push({
         kind: "scheduled",
         task: toTaskDefinition(row),
@@ -126,16 +191,11 @@ export async function claimDueItems(
     }
 
     // 2) 手动运行（run-now 入队的 pending 执行行）
-    const manual = (await tx.$queryRaw(
-      Prisma.sql`
-        SELECT te.id, te.scheduled_at AS scheduledAt, te.task_id AS taskId
-        FROM task_execution te
-        WHERE te.status = 'pending' AND te.trigger = 'manual'
-        ORDER BY te.created_at ASC
-        LIMIT ${batchSize}
-        FOR UPDATE SKIP LOCKED
-      `,
-    )) as Array<{ id: string; scheduledAt: Date; taskId: string }>;
+    const manual = (await tx.$queryRaw(pendingManualSelectSql(batchSize, skipLocked))) as Array<{
+      id: string;
+      scheduledAt: Date;
+      taskId: string;
+    }>;
 
     if (manual.length > 0) {
       const taskRows = (await tx.$queryRaw(
@@ -151,9 +211,13 @@ export async function claimDueItems(
         if (!row) {
           continue;
         }
-        await tx.$executeRaw(
-          Prisma.sql`UPDATE task_execution SET status = 'running' WHERE id = ${exec.id}`,
+        // 兼容路径下抢不到（status 已非 pending）则跳过；SKIP LOCKED 路径必命中。
+        const claimed = await tx.$executeRaw(
+          Prisma.sql`UPDATE task_execution SET status = 'running' WHERE id = ${exec.id} AND status = 'pending'`,
         );
+        if (claimed === 0) {
+          continue;
+        }
         items.push({
           kind: "manual",
           task: toTaskDefinition(row),

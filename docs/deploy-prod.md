@@ -38,11 +38,11 @@ cp .env.production.example .env.production
 # 2) 构建并启动（entrypoint 会自动执行 prisma migrate deploy）
 docker compose -f docker-compose.prod.yml up -d --build
 
-# 3) 可选：种子冒烟任务（默认租户 + bootstrap token 已由 ensureBootstrap 处理，仅任务表为空时插 noop）
+# 3) 必跑：种子（仅引导 default 租户 + bootstrap token，不插入任务）
 docker compose -f docker-compose.prod.yml run --rm scheduled npx tsx prisma/seed.ts
 ```
 
-> bootstrap：首次启动 `ensureBootstrap` 会在库中创建 `default` 租户 + 把 `APP_BOOTSTRAP_TOKEN` 哈希写入 `api_token`。WEB 控制台登录用该 token。
+> bootstrap：`ensureBootstrap` 只在 seed 内被调用（web/worker 启动不做 bootstrap）——库为空时会创建 `default` 租户 + 把 `APP_BOOTSTRAP_TOKEN` 哈希写入 `api_token`（幂等）。WEB 控制台登录用该 token。
 
 ## 三、验证
 

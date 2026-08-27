@@ -76,7 +76,8 @@ export async function enqueueNotificationsFromRun(
       ctx.recipients.length > 0 &&
       (ctx.notifyOn.includes("succeeded") || ctx.notifyOn.includes("failed")) &&
       ctx.notifyOn.includes(statusKey);
-    const shouldWebhook = !!ctx.webhookUrl;
+    // webhook 与邮件同受 notifyOn 约束（timeout/dead 按 failed 归类）
+    const shouldWebhook = !!ctx.webhookUrl && ctx.notifyOn.includes(statusKey);
 
     if (!shouldEmail && !shouldWebhook) {
       return;

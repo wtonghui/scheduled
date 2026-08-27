@@ -1,0 +1,61 @@
+# ─────────────────────────────────────────────────────────────
+# scheduled 首次部署（OCP）：迁移 + 种子 一次性 Job
+#
+# 只做两件事（均幂等，可重复执行）：
+#   1. initContainer：prisma migrate deploy（应用 schema）
+#   2. container：prisma/seed.ts —— 仅引导 default 租户 + bootstrap token
+#      （APP_BOOTSTRAP_TOKEN 的 SHA-256 哈希写入 api_token），不插入任何示例任务
+#
+# 运行前须就绪：
+#   - Secret `scheduled-env`（DATABASE_URL / APP_BOOTSTRAP_TOKEN /
+#     PAYLOAD_ENCRYPTION_KEY / MAIL_* / SSRF_* 等，见云部署前准备）
+#   - MySQL 可达（DATABASE_URL 指向的库 + 账号建好）
+#
+# 权限：ServiceAccount `scheduled` 需 anyuid SCC（镜像未设 USER，默认以 root 运行）
+#   oc create serviceaccount scheduled
+#   oc adm policy add-scc-to-user anyuid -z scheduled
+#
+# 用法：
+#   oc apply -f seed-job.yaml
+#   oc logs job/scheduled-migrate-seed -f     # 见 "seed: done (default tenant + bootstrap token ensured)" 即成功
+#   oc delete job scheduled-migrate-seed      # 用后清理（Job 已设置 ttl 自动回收）
+# ─────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: scheduled-migrate-seed
+  labels:
+    app: scheduled
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600   # 成功后 1h 自动清理 Job 与 Pod
+  template:
+    metadata:
+      labels:
+        app: scheduled
+        job: migrate-seed
+    spec:
+      serviceAccountName: scheduled
+      restartPolicy: Never
+      initContainers:
+        - name: migrate
+          image: <REGISTRY>/scheduled:<TAG>   # 替换为实际镜像地址（可用 oc get imagestreamtag -n <ns> 查）
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: scheduled-env
+          env:
+            - name: NODE_ENV
+              value: "production"
+          command: ["npx", "prisma", "migrate", "deploy"]
+      containers:
+        - name: seed
+          image: <REGISTRY>/scheduled:<TAG>
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: scheduled-env
+          env:
+            - name: NODE_ENV
+              value: "production"
+          command: ["npx", "tsx", "prisma/seed.ts"]

@@ -1,10 +1,10 @@
+import { decryptSecret } from "../src/lib/crypto";
 import { prisma } from "../src/lib/db";
 import { HttpError } from "../src/lib/errors";
+import { logger } from "../src/lib/logger";
 import { classifyError, jitteredDelayMs } from "../src/lib/retry";
 import { checkUrlForSsrf } from "../src/lib/ssrf";
-import { decryptSecret } from "../src/lib/crypto";
 import { signWebhook } from "../src/modules/webhook/signature";
-import { logger } from "../src/lib/logger";
 
 /**
  * Webhook 中继（FR-016 / contracts 投递契约）：
@@ -75,8 +75,7 @@ export async function runWebhookRelayOnce(limit = 20): Promise<number> {
     } catch (error) {
       const attempts = row.attempts + 1;
       const base = { attempts, lastError: (error as Error).message };
-      const permanent =
-        classifyError(error) === "permanent" || row.attempts + 1 >= row.maxAttempts;
+      const permanent = classifyError(error) === "permanent" || row.attempts + 1 >= row.maxAttempts;
       if (permanent) {
         await prisma.webhookDelivery.update({
           where: { id: row.id },
@@ -84,6 +83,11 @@ export async function runWebhookRelayOnce(limit = 20): Promise<number> {
         });
         logger.error({ run_id: row.runId, attempts }, "webhook dead-lettered");
       } else {
+        // 可重试失败：记 warn（此前静默，只有死信才有日志）
+        logger.warn(
+          { run_id: row.runId, attempts, err: (error as Error).message },
+          "webhook delivery failed, will retry",
+        );
         await prisma.webhookDelivery.update({
           where: { id: row.id },
           data: {
