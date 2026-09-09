@@ -21,6 +21,12 @@ interface TaskDetail {
   name: string;
   cron: string | null;
   scheduleIntervalSeconds: number | null;
+  runAt: string | null;
+  timezone: string;
+  retryDelayMs: number | null;
+  overlapPolicy: string;
+  endsAt: string | null;
+  maxRuns: number | null;
   taskType: "http" | "noop";
   payload: Record<string, unknown>;
   enabled: boolean;
@@ -29,6 +35,7 @@ interface TaskDetail {
   recipients: string[];
   notifyOn: string[];
   webhookUrl: string | null;
+  systemUserId?: string | null;
   nextRunAt: string | null;
   version: number;
   writable: boolean;
@@ -54,7 +61,12 @@ const STATUS_TONE: Record<string, "ok" | "info" | "bad" | "warn" | "neutral"> = 
   timeout: "warn",
   dead: "bad",
   interrupted: "warn",
+  skipped: "neutral",
 };
+
+function overlapLabel(policy: string): string {
+  return policy === "queue" ? "排队" : policy === "run" ? "允许并行" : "跳过";
+}
 
 export default function TaskDetailPage() {
   const params = useParams<{ id: string }>();
@@ -152,18 +164,27 @@ export default function TaskDetailPage() {
     );
   }
 
+  const scheduleText = task.runAt
+    ? `仅一次 ${new Date(task.runAt).toLocaleString()}`
+    : (task.cron ?? (task.scheduleIntervalSeconds ? `每 ${task.scheduleIntervalSeconds} 秒` : "—"));
   const metaItems: Array<[string, React.ReactNode]> = [
     ["标识", <code key="id">{task.id}</code>],
     ["类型", task.taskType],
-    ["计划", <code key="cron">{task.cron ?? "—"}</code>],
+    ["计划", <code key="cron">{scheduleText}</code>],
+    ...(task.cron ? [["时区", task.timezone] as [string, React.ReactNode]] : []),
     [
       "下次运行",
       <code key="next">{task.nextRunAt ? new Date(task.nextRunAt).toLocaleString() : "—"}</code>,
     ],
     ["重试上限", String(task.maxAttempts)],
+    ["重试等待", task.retryDelayMs != null ? `${task.retryDelayMs}ms` : "默认退避"],
+    ["重叠策略", overlapLabel(task.overlapPolicy)],
+    ["截止", task.endsAt ? new Date(task.endsAt).toLocaleString() : "持续到手动停"],
+    ["总次数", task.maxRuns != null ? String(task.maxRuns) : "不限"],
     ["超时", `${task.timeoutMs}ms`],
     ["收件人", task.recipients.join(", ") || "—"],
     ["回调", task.webhookUrl ? <code key="hook">{task.webhookUrl}</code> : "—"],
+    ["系统用户", task.systemUserId ? <code key="sys-user">{task.systemUserId}</code> : "—"],
   ];
 
   return (

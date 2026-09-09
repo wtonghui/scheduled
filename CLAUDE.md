@@ -69,10 +69,12 @@ npm run coverage
 
 ### 调度模型（`src/lib/cron.ts` + `worker/scheduler.ts`）
 
-- 调度方式二选一：`cron`（5/6 段，**默认按 Asia/Shanghai 解析**，`cron.ts` 可透传任意 IANA 时区）**或** `scheduleIntervalSeconds`（固定间隔），`isValidSchedule` 强制恰有一个非空。
-- Worker 每轮单事务：`SELECT ... FOR UPDATE SKIP LOCKED`（**版本探测**：MySQL <8.0.1 / MariaDB <10.6 不支持时自动退化为「条件 UPDATE + 受影响行数」的可移植领取，多实例仍恰好一次）领取到期任务 → 写租约（`claimed_by` / `claimed_until`）→ 推进 `next_run_at`。
-- **重启不补跑**：`advanceMissedRuns` 只把错过的 `next_run_at` 推进到下一次未来运行；`reclaimExpiredLeases` 清扫过期租约。
-- 手动运行（`run-now`）：入队 `status='pending' AND trigger='manual'` 的执行行，由 worker 领取。
+- 调度方式三选一：`cron`（5/6/7 段，7 段为 Quartz 式 `秒 分 时 日 月 周 年`；按任务 `timezone` 列解析，默认 `Asia/Shanghai`）**或** `scheduleIntervalSeconds`（固定间隔，顺延语义）**或** `runAt`（一次性绝对时刻，跑完自动停用），DTO 层 `isValidScheduleTriple` 强制恰有一个非空；`retryDelayMs` 为同次调度内重试等待基线（null=默认 1s×2/30s 封顶退避）；`overlapPolicy`（skip/queue/run，默认 skip=今天行为）控制上次未结束时下次到点的行为；`endsAt`/`maxRuns` 为结束规则（可共存，谁先到谁停；仅重复调度，一次性任务禁配）。
+- Worker 每轮单事务领取到期任务 → 写租约（`claimed_by` / `claimed_until`）→ 推进 `next_run_at`；`SELECT ... FOR UPDATE SKIP LOCKED`（**版本探测**：MySQL <8.0.1 / MariaDB <10.6 不支持时自动退化为「条件 UPDATE + 受影响行数」的可移植领取，多实例仍恰好一次）。
+- **执行与领取解耦**（`worker/runner.ts`）：`runLoop` 每轮只按并发池 `freeSlots` 领取数量、`runner.submit()` 入池立即返回——单条长任务/流式只占自己的并发槽，不阻塞其他任务领取执行；邮件/Webhook 中继走独立后台通道（`relayLoop`），不进领取关键路径。**关机**：SIGTERM 先排空，超 `SHUTDOWN_GRACE_MS` 对在途任务 abort（`shutdownController`）。
+- **租约续期 + 孤儿对账**：heartbeat（≈10s）对运行中任务续 `claimed_until`（只续 `claimed_by=自己` 的行，`renewTaskLeases`），长任务不丢租约→不被别实例重复领取；`reconcileOrphanExecutions` 把租约过期的 `running` 执行整定为 failed（**不重跑**，防双副作用）并清过期认领。
+- **补跑语义**：调度层停机期间错过的到期**不补跑**（`advanceMissedRuns` 只推进 `next_run_at`）；执行层 `pending` 执行行（run-now，或故障死窗口遗留的陈旧行，创建超 5s 宽限 `PENDING_RECLAIM_GRACE_SECONDS`）重启后被重新领取执行（补跑）；`reclaimExpiredLeases` 清扫过期租约。
+- 手动运行（`run-now`）：入队 `status='pending'` 执行行，由 worker 领取。
 - 乐观并发：`version` 字段，更新冲突 → 409。
 
 ### 鉴权（`src/modules/auth/`）
@@ -105,6 +107,7 @@ outbox 表按 `run_id` UNIQUE；执行、邮件、Webhook 各自以 run_id 串�
 - **worker 进程生命周期**：`SKIP LOCKED` 只保证"多实例并发领取安全"，**不保证"旧代码被换掉"**。部署/重启后务必确认没有残留的旧 worker（non-watch 的 `npx tsx worker/index.ts`、PM2 旧实例、多个 dev 进程可能并存）——旧代码 worker 会继续领取并误停任务（2026-08-21 事故根因：一个 9:14 启动、非 watch 的 worker 一直跑修复前代码，把任务逐个停用）。
 - **时区约定（2026-08-24 起固定）**：容器 `TZ: Asia/Shanghai`（`docker exec` 看库为 +08），但**应用会话经 `DATABASE_URL?...&timezone=Z` 强制 UTC**——调度比较（`NOW()` 与写入的 `next_run_at`）一律按 UTC 自洽。原因：Prisma 7 driver-adapter 把 JS Date 序列化为 UTC 固化值、不受进程 TZ 影响，若与服务器时钟基准不同会差 8h；容器 +08 只是运维可见性。**裸 `mysql2` 默认 `timezone:'local'`，传 JS Date 产生 ±8h 偏移**（曾致恢复任务延后 8 小时才到期）——运维/恢复脚本请用 SQL 端时间（`DATE_ADD(NOW(), ...)`）或走 Prisma，不要裸 mysql2 传 Date。改连接串时勿删 `timezone=Z`。**对外时间戳契约（2026-08-25 起）**：存储保持 UTC，但 REST 响应、完成邮件、webhook payload 里的时间一律序列化为带 `+08:00` 偏移的 ISO 8601（北京时间）——REST 在 `api-envelope.ts` 的 `ok()` 经 `src/lib/datetime.ts`（luxon）收口，邮件/webhook 在 `notification/service.tsx` 用 `toBeijingIso`；前端 `toLocaleString()` 直接可用，勿在展示层再手写 UTC 转换。幂等键里的 `toISOString()` 是内部标识，勿改成带偏移格式。
 - **改 `worker/` 的调度/领取逻辑**：必须考虑 SKIP LOCKED 并发（不支持时自动退化为条件 UPDATE 领取）、租约超时回收、不补跑语义；改 schema 后跑 `prisma:generate` + `migrate`。
+- **HTTP 执行器结果日志（`src/modules/execution/executors/http.ts`）**：2xx 结果完整写入 logger（`http task ok`）；流式响应按 content-type 自动识别——`text/event-stream`→SSE 逐 event（取 `data:` 行）、`ndjson`/`jsonl`/`stream+json`→逐行，逐步记录（`http stream event`）+ 汇总（`http stream complete`），**接口完整跑完后才发终态邮件**。**流式超时是空闲超时**：执行器每次读到 chunk 调 `onProgress()` 续命 `withTimeout`，连续 `timeoutMs` 无数据才中止，非流式维持总时长。改日志时注意：url 只记 origin+pathname（并入的 query params 属加密 secrets，别重新引入明文日志）。
 - **任务表单/回显**：任务只用 `cron` 字符串字段存储；结构化界面（`src/components/tasks/ScheduleBuilder.tsx` + `src/lib/schedule-builder.ts`）在前端做「结构化 spec ↔ cron 字符串」双向转换，编辑回显时同样在前端反解。
 - API 路由文件用 `@/`（→ `src`）与 `@worker`（→ `worker`）别名；import 别用相对路径跨大目录。
 - 错误模型：`src/lib/errors.ts` 的 `AppError` → HTTP 状态映射；统一走 `api-envelope` 响应格式，不要直接 `NextResponse.json` 裸返回。

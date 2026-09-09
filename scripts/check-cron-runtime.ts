@@ -33,6 +33,22 @@ assert(
 // 6 段(含秒)合法 cron
 assert(isValidCron("0 25 6 * * *"), '六段 cron "0 25 6 * * *" 应为 true');
 
+// 7 段(含年，croner 路径)：合法、能算出未来时间、过去年份返回 null
+assert(isValidCron("0 0 9 1 1 * 2027"), '七段 cron "0 0 9 1 1 * 2027" 应为 true');
+const nextYear = computeNextRun(
+  { cron: "0 0 9 1 1 * 2099", scheduleIntervalSeconds: null },
+  new Date(),
+);
+assert(
+  nextYear instanceof Date && nextYear.getTime() > Date.now(),
+  `computeNextRun("0 0 9 1 1 * 2099") 应返回未来时间,实际=${String(nextYear)}`,
+);
+const pastYear = nextRunAt("0 0 9 1 1 * 2020");
+assert(
+  pastYear === null,
+  `nextRunAt("0 0 9 1 1 * 2020") 应为 null(年份已过),实际=${String(pastYear)}`,
+);
+
 // 永无未来运行点的合法表达式("2月30日"):应返回 null(触发自动停用的语义)而不是抛错
 const never = nextRunAt("0 0 30 2 *");
 assert(
@@ -45,4 +61,4 @@ if (failures.length > 0) {
   process.exit(1);
 }
 
-console.log("[check-cron-runtime] OK: cron-parser 在 tsx 运行时下解析正常");
+console.log("[check-cron-runtime] OK: cron-parser/croner 在 tsx 运行时下解析正常");

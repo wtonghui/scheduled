@@ -145,7 +145,7 @@ export default function ScheduleBuilder({ onChange, defaultValue }: Props) {
       {advanced ? (
         <Card className="space-y-2.5 bg-surface-sunken/50 p-3">
           <div>
-            <Label htmlFor="sb-raw-cron">原始 cron（5/6 段，UTC）</Label>
+            <Label htmlFor="sb-raw-cron">原始 cron（5/6/7 段，7 段末位为年，UTC）</Label>
             <Input
               id="sb-raw-cron"
               value={rawCron}

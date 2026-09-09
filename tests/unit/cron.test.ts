@@ -19,6 +19,18 @@ describe("isValidCron", () => {
     expect(isValidCron("60 * * * *")).toBe(false); // minute > 59
     expect(isValidCron("* * *")).toBe(false);
   });
+
+  it("accepts 7-field Quartz expressions with year", () => {
+    expect(isValidCron("0 0 9 1 1 * 2027")).toBe(true);
+    expect(isValidCron("0 0 9 1 1 * 2027-2029")).toBe(true);
+    expect(isValidCron("0 0 9 1 1 * *")).toBe(true);
+  });
+
+  it("rejects bad 7-field expressions", () => {
+    expect(isValidCron("0 0 9 1 1 * 2027 8")).toBe(false); // 8 段
+    expect(isValidCron("60 0 9 1 1 * 2027")).toBe(false); // 秒 > 59
+    expect(isValidCron("0 0 9 1 1 * abcd")).toBe(false); // 年非数字
+  });
 });
 
 describe("nextRunAt", () => {
@@ -47,6 +59,25 @@ describe("nextRunAt", () => {
   it("returns null when no future run exists", () => {
     // 每年 2 月 30 日不存在 → 无下一个发生
     expect(nextRunAt("0 0 30 2 *", from)).toBeNull();
+  });
+
+  it("supports 7-field year: next run lands in the specified year", () => {
+    // 2027-01-01 09:00 +08 = 2027-01-01T01:00:00Z
+    expect(nextRunAt("0 0 9 1 1 * 2027", from)?.toISOString()).toBe("2027-01-01T01:00:00.000Z");
+  });
+
+  it("supports 7-field year ranges", () => {
+    expect(nextRunAt("0 0 9 1 1 * 2027-2029", from)?.toISOString()).toBe(
+      "2027-01-01T01:00:00.000Z",
+    );
+  });
+
+  it("returns null for a past year (→ 创建时 400 / 跑后自动停用)", () => {
+    expect(nextRunAt("0 0 9 1 1 * 2020", from)).toBeNull();
+  });
+
+  it("returns null for impossible date with year", () => {
+    expect(nextRunAt("0 0 0 30 2 * 2027", from)).toBeNull();
   });
 });
 

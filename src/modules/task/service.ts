@@ -1,4 +1,4 @@
-import { computeNextRun } from "@/lib/cron";
+import { DEFAULT_TIMEZONE, computeNextRun } from "@/lib/cron";
 import { decryptJson, encryptJson, encryptSecret, generateWebhookSecret } from "@/lib/crypto";
 import { prisma } from "@/lib/db";
 import { AppError } from "@/lib/errors";
@@ -31,6 +31,12 @@ type TaskRow = Prisma.TaskGetPayload<{
     name: true;
     cron: true;
     scheduleIntervalSeconds: true;
+    runAt: true;
+    timezone: true;
+    retryDelayMs: true;
+    overlapPolicy: true;
+    endsAt: true;
+    maxRuns: true;
     taskType: true;
     payload: true;
     payloadSecrets: true;
@@ -52,6 +58,18 @@ export interface TaskView {
   name: string;
   cron: string | null;
   scheduleIntervalSeconds: number | null;
+  /** 一次性时刻；与 cron/interval 三选一，执行后自动停用 */
+  runAt: Date | null;
+  /** cron 解析用 IANA 时区（非 cron 调度恒为默认时区） */
+  timezone: string;
+  /** 同次调度内重试等待基线（毫秒）；null=默认退避（1s 起×2/30s 封顶） */
+  retryDelayMs: number | null;
+  /** 重叠策略：skip 跳过 / queue 排队 / run 允许并行（默认 skip） */
+  overlapPolicy: string;
+  /** 重复调度截止时刻；与 maxRuns 可共存（谁先到谁停） */
+  endsAt: Date | null;
+  /** 重复调度总次数上限（调度触发计，run-now/重试/跳过不计） */
+  maxRuns: number | null;
   taskType: "http" | "noop";
   payload: Record<string, unknown>;
   enabled: boolean;
@@ -60,6 +78,7 @@ export interface TaskView {
   recipients: string[];
   notifyOn: string[];
   webhookUrl: string | null;
+  systemUserId?: string | null;
   nextRunAt: Date | null;
   version: number;
   createdAt: Date;
@@ -106,6 +125,12 @@ function toView(row: TaskRow): TaskView {
     name: row.name,
     cron: row.cron,
     scheduleIntervalSeconds: row.scheduleIntervalSeconds,
+    runAt: row.runAt,
+    timezone: row.timezone,
+    retryDelayMs: row.retryDelayMs,
+    overlapPolicy: row.overlapPolicy,
+    endsAt: row.endsAt,
+    maxRuns: row.maxRuns,
     taskType: row.taskType,
     payload,
     enabled: row.enabled,
@@ -114,6 +139,7 @@ function toView(row: TaskRow): TaskView {
     recipients: row.recipients as string[],
     notifyOn: row.notifyOn as string[],
     webhookUrl: row.webhookUrl,
+    systemUserId: (row as any).systemUserId ?? null,
     nextRunAt: row.nextRunAt,
     version: row.version,
     createdAt: row.createdAt,
@@ -140,6 +166,8 @@ export interface TaskListQuery {
   q?: string;
   /** 仅显示该 owner token 创建的任务（租户内按 token 隔离视图）。 */
   ownerTokenId?: string;
+  /** 按系统内用户筛选任务（外部接入系统具体用户）。 */
+  systemUserId?: string;
 }
 
 export async function list(tenantId: string, query: TaskListQuery) {
@@ -152,6 +180,7 @@ export async function list(tenantId: string, query: TaskListQuery) {
     taskType: query.taskType,
     q: query.q,
     ownerTokenId: query.ownerTokenId,
+    systemUserId: query.systemUserId,
   });
   return {
     data: rows.map(toView),
@@ -174,6 +203,7 @@ export async function listAll(viewerTenantId: string | null, query: TaskListQuer
     taskType: query.taskType,
     q: query.q,
     ownerTokenId: query.ownerTokenId,
+    systemUserId: query.systemUserId,
   });
   return {
     data: rows.map((row) => toViewAll(row, viewerTenantId)),
@@ -226,18 +256,31 @@ export async function create(
   }
 
   const { publicPayload, secretBytes } = splitPayload(data.taskType, httpPayload);
-  const nextRunAt = computeNextRun(
-    { cron: data.cron, scheduleIntervalSeconds: data.scheduleIntervalSeconds },
-    new Date(),
-  );
+  const timezone = data.timezone ?? DEFAULT_TIMEZONE;
+  const nextRunAt = data.runAt
+    ? new Date(data.runAt)
+    : computeNextRun(
+        { cron: data.cron, scheduleIntervalSeconds: data.scheduleIntervalSeconds },
+        new Date(),
+        timezone,
+      );
   if (!nextRunAt) {
     throw new AppError(400, "VALIDATION", "schedule yields no future run");
+  }
+  if (data.endsAt && new Date(data.endsAt).getTime() <= nextRunAt.getTime()) {
+    throw new AppError(400, "VALIDATION", "endsAt is before the first scheduled run");
   }
 
   const row = await repoCreate(tenantId, ownerTokenId, {
     name: data.name,
     cron: data.cron ?? null,
     scheduleIntervalSeconds: data.scheduleIntervalSeconds ?? null,
+    runAt: data.runAt ? new Date(data.runAt) : null,
+    timezone,
+    retryDelayMs: data.retryDelayMs ?? null,
+    overlapPolicy: data.overlapPolicy,
+    endsAt: data.endsAt ? new Date(data.endsAt) : null,
+    maxRuns: data.maxRuns ?? null,
     taskType: data.taskType,
     payload: publicPayload,
     payloadSecrets: secretBytes ? new Uint8Array(secretBytes) : null,
@@ -247,6 +290,7 @@ export async function create(
     recipients: data.recipients as Prisma.InputJsonValue,
     notifyOn: data.notifyOn as Prisma.InputJsonValue,
     webhookUrl: data.webhookUrl ?? null,
+    ...(data.systemUserId ? { systemUserId: data.systemUserId } : {}),
     webhookSecret: data.webhookUrl ? new Uint8Array(encryptSecret(generateWebhookSecret())) : null,
     nextRunAt,
   });
@@ -291,31 +335,78 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
     secretsUpdate = split.secretBytes;
   }
 
-  // 重算 next_run_at
+  // 重算 next_run_at（生效调度 = 传入覆盖既有；传入新调度会清掉其它调度字段，保持三选一）
   let nextRunAt: Date | null | undefined;
-  if ("cron" in data || "scheduleIntervalSeconds" in data) {
-    nextRunAt = computeNextRun(
-      {
-        cron: (data.cron ?? existing.cron ?? undefined) as string | undefined,
-        scheduleIntervalSeconds: (data.scheduleIntervalSeconds ??
-          existing.scheduleIntervalSeconds ??
-          undefined) as number | undefined,
-      },
-      new Date(),
-    );
+  const scheduleTouched = "cron" in data || "scheduleIntervalSeconds" in data || "runAt" in data;
+  // 生效时区：仅 cron 调度有意义；切到 interval/runAt 时归位默认，避免过期值误导
+  let timezoneToStore: string | undefined;
+  if (scheduleTouched || "timezone" in data) {
+    const effCron = data.cron !== undefined ? data.cron : existing.cron;
+    const effInterval =
+      data.scheduleIntervalSeconds !== undefined
+        ? data.scheduleIntervalSeconds
+        : existing.scheduleIntervalSeconds;
+    const effRunAt =
+      data.runAt !== undefined ? (data.runAt ? new Date(data.runAt) : null) : existing.runAt;
+    const effKind = effRunAt ? "runAt" : effCron ? "cron" : effInterval ? "interval" : null;
+    if (!effKind) {
+      throw new AppError(
+        400,
+        "VALIDATION",
+        "exactly one of cron, scheduleIntervalSeconds or runAt is required",
+      );
+    }
+    if (
+      data.timezone !== undefined &&
+      data.timezone !== null &&
+      effKind !== "cron" &&
+      effKind !== "runAt"
+    ) {
+      throw new AppError(
+        400,
+        "VALIDATION",
+        "timezone is only meaningful with cron or runAt (fixed intervals carry no wall-clock)",
+      );
+    }
+    // 结束规则/重叠策略仅重复调度可配；单独出现时按既有调度校验（一次任务 → 400）
+    const endRuleTouched = "endsAt" in data || "maxRuns" in data || "overlapPolicy" in data;
+    if (endRuleTouched && effKind === "runAt") {
+      throw new AppError(
+        400,
+        "VALIDATION",
+        "run-once tasks take no end rules or overlap policy (exactly one run)",
+      );
+    }
+    const effTimezone =
+      data.timezone !== undefined ? (data.timezone ?? DEFAULT_TIMEZONE) : existing.timezone;
+    timezoneToStore = effKind === "cron" || effKind === "runAt" ? effTimezone : DEFAULT_TIMEZONE;
+    nextRunAt = effRunAt
+      ? effRunAt
+      : computeNextRun(
+          {
+            cron: (effCron ?? undefined) as string | undefined,
+            scheduleIntervalSeconds: (effInterval ?? undefined) as number | undefined,
+          },
+          new Date(),
+          effTimezone,
+        );
   }
   if (data.enabled === false) {
     nextRunAt = null;
   } else if (data.enabled === true && existing.enabled === false) {
-    nextRunAt = computeNextRun(
-      {
-        cron: (existing.cron ?? undefined) as string | undefined,
-        scheduleIntervalSeconds: (existing.scheduleIntervalSeconds ?? undefined) as
-          | number
-          | undefined,
-      },
-      new Date(),
-    );
+    // 重启用：按既有调度（含一次性时刻与时区）重算；已过的一次性时刻由 worker 到期即领
+    nextRunAt = existing.runAt
+      ? existing.runAt
+      : computeNextRun(
+          {
+            cron: (existing.cron ?? undefined) as string | undefined,
+            scheduleIntervalSeconds: (existing.scheduleIntervalSeconds ?? undefined) as
+              | number
+              | undefined,
+          },
+          new Date(),
+          existing.timezone,
+        );
   }
 
   const row = await updateTaskWithVersion(
@@ -323,11 +414,27 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
     id,
     {
       ...(data.name !== undefined && { name: data.name }),
-      // 调度字段必须随更新落库，否则只重算 next_run_at、cron 列不变（编辑 cron 不生效）
-      ...(data.cron !== undefined && { cron: data.cron }),
+      // 调度字段必须随更新落库，否则只重算 next_run_at、cron 列不变（编辑 cron 不生效）；
+      // 传入新调度会清掉其它调度字段（DTO 已保证三选一），防止 cron/interval/runAt 并存
+      ...(data.cron !== undefined && {
+        cron: data.cron,
+        ...(typeof data.cron === "string" ? { scheduleIntervalSeconds: null, runAt: null } : {}),
+      }),
       ...(data.scheduleIntervalSeconds !== undefined && {
         scheduleIntervalSeconds: data.scheduleIntervalSeconds,
+        ...(typeof data.scheduleIntervalSeconds === "number" ? { cron: null, runAt: null } : {}),
       }),
+      ...(data.runAt !== undefined && {
+        runAt: data.runAt ? new Date(data.runAt) : null,
+        ...(typeof data.runAt === "string" ? { cron: null, scheduleIntervalSeconds: null } : {}),
+      }),
+      ...(timezoneToStore !== undefined && { timezone: timezoneToStore }),
+      ...(data.retryDelayMs !== undefined && { retryDelayMs: data.retryDelayMs }),
+      ...(data.overlapPolicy !== undefined && { overlapPolicy: data.overlapPolicy }),
+      ...(data.endsAt !== undefined && {
+        endsAt: data.endsAt ? new Date(data.endsAt) : null,
+      }),
+      ...(data.maxRuns !== undefined && { maxRuns: data.maxRuns }),
       ...(data.taskType !== undefined && { taskType: data.taskType }),
       ...(payloadUpdate !== undefined && { payload: payloadUpdate }),
       ...(secretsUpdate !== undefined && {
@@ -345,6 +452,9 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
         webhookSecret: data.webhookUrl
           ? new Uint8Array(encryptSecret(generateWebhookSecret()))
           : null,
+      }),
+      ...(data.systemUserId !== undefined && {
+        systemUserId: data.systemUserId || null,
       }),
       ...(nextRunAt !== undefined && { nextRunAt }),
     },

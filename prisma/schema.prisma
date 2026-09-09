@@ -20,6 +20,7 @@ enum RunStatus {
   timeout
   dead
   interrupted
+  skipped // 上次未结束被跳过的到期 tick（overlapPolicy=skip 的审计行，不计入 maxRuns）
 }
 
 enum EmailStatus {
@@ -47,6 +48,12 @@ model Task {
   name                    String          @db.VarChar(191)
   cron                    String?         @db.VarChar(64)
   scheduleIntervalSeconds Int?            @map("schedule_interval_seconds")
+  runAt                   DateTime?       @map("run_at") @db.DateTime(6) // 一次性时刻；与 cron/interval 三选一
+  timezone                String          @default("Asia/Shanghai") @map("timezone") @db.VarChar(64) // cron 解析用 IANA 时区
+  retryDelayMs            Int?            @map("retry_delay_ms") // 同次调度内重试等待基线（毫秒）；null=沿用默认退避
+  overlapPolicy           String          @default("skip") @map("overlap_policy") @db.VarChar(16) // 上次未结束时：skip 跳过 / queue 排队 / run 允许并行
+  endsAt                  DateTime?       @map("ends_at") @db.DateTime(6) // 重复调度的截止时刻；与 maxRuns 可共存（谁先到谁停）
+  maxRuns                 Int?            @map("max_runs") // 重复调度的总次数上限（调度触发计，run-now/重试/跳过不计）
   taskType                TaskType        @default(http) @map("task_type")
   payload                 Json
   payloadSecrets          Bytes?          @map("payload_secrets") // AES-256-GCM 密文（含 nonce）
@@ -63,6 +70,7 @@ model Task {
   version                 Int             @default(1)
   tenantId                String          @map("tenant_id")
   ownerTokenId            String          @map("owner_token_id") // 创建该任务的 API token（租户内按 token 隔离视图用）
+  systemUserId            String?         @map("system_user_id") @db.VarChar(191) // 系统内用户标识（外部接入系统的具体用户）
   createdAt               DateTime        @default(now()) @map("created_at") @db.DateTime(6)
   updatedAt               DateTime        @updatedAt @map("updated_at") @db.DateTime(6)
   tenant                  Tenant          @relation(fields: [tenantId], references: [id])
@@ -74,6 +82,7 @@ model Task {
   @@index([tenantId, nextRunAt])
   @@index([tenantId, enabled])
   @@index([ownerTokenId])
+  @@index([tenantId, systemUserId, enabled])
   @@map("task")
 }
 
@@ -89,6 +98,7 @@ model TaskExecution {
   durationMs        Int?              @map("duration_ms")
   error             Json?
   trigger           String            @db.VarChar(16)
+  systemUserId     String?           @map("system_user_id") @db.VarChar(191) // 系统内用户标识
   createdAt         DateTime          @default(now()) @map("created_at") @db.DateTime(6)
   task              Task              @relation(fields: [taskId], references: [id], onDelete: Cascade)
   emailLogs         EmailLog[]
@@ -118,6 +128,7 @@ model EmailLog {
   sentAt           DateTime?     @map("sent_at") @db.DateTime(6)
   createdAt        DateTime      @default(now()) @map("created_at") @db.DateTime(6)
   updatedAt        DateTime      @updatedAt @map("updated_at") @db.DateTime(6)
+  systemUserId    String?       @map("system_user_id") @db.VarChar(191) // 系统内用户标识
   execution        TaskExecution @relation(fields: [runId], references: [id])
   tenant           Tenant        @relation(fields: [tenantId], references: [id])
 
@@ -163,6 +174,7 @@ model WebhookDelivery {
   lastError     String?       @map("last_error") @db.Text
   nextRetryAt   DateTime?     @map("next_retry_at") @db.DateTime(6)
   sentAt        DateTime?     @map("sent_at") @db.DateTime(6)
+  systemUserId String?       @map("system_user_id") @db.VarChar(191) // 系统内用户标识
   createdAt     DateTime      @default(now()) @map("created_at") @db.DateTime(6)
   execution     TaskExecution @relation(fields: [runId], references: [id])
   tenant        Tenant        @relation(fields: [tenantId], references: [id])

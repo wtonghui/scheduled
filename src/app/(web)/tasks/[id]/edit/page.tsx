@@ -22,6 +22,12 @@ interface TaskDetail {
   name: string;
   cron: string | null;
   scheduleIntervalSeconds: number | null;
+  runAt: string | null;
+  timezone: string;
+  retryDelayMs: number | null;
+  overlapPolicy: string;
+  endsAt: string | null;
+  maxRuns: number | null;
   taskType: "http" | "noop";
   payload: Record<string, unknown>;
   enabled: boolean;
@@ -30,6 +36,7 @@ interface TaskDetail {
   recipients: string[];
   notifyOn: string[];
   webhookUrl: string | null;
+  systemUserId?: string | null;
   nextRunAt: string | null;
   version: number;
   writable: boolean;
@@ -104,6 +111,12 @@ export default function EditTaskPage() {
       name: values.name,
       cron: values.cron ?? null,
       scheduleIntervalSeconds: values.scheduleIntervalSeconds ?? null,
+      runAt: values.runAt ?? null,
+      timezone: values.timezone ?? null,
+      retryDelayMs: values.retryDelayMs ?? null,
+      ...(values.overlapPolicy ? { overlapPolicy: values.overlapPolicy } : {}),
+      endsAt: values.endsAt ?? null,
+      maxRuns: values.maxRuns ?? null,
       taskType: values.taskType,
       payload:
         values.taskType === "http"
@@ -117,7 +130,8 @@ export default function EditTaskPage() {
           : {},
       recipients: values.recipients,
       notifyOn: values.notifyOn,
-      webhookUrl: values.webhookUrl || null, // 空串 → 移除回调
+      webhookUrl: values.webhookUrl || null,
+      ...(values.systemUserId ? { systemUserId: values.systemUserId } : {}),
       version: task.version,
     });
     toast("已保存，调度下轮轮询生效", "success");
@@ -161,10 +175,17 @@ export default function EditTaskPage() {
           taskType: task.taskType,
           cron: task.cron,
           scheduleIntervalSeconds: task.scheduleIntervalSeconds,
+          runAt: task.runAt,
+          timezone: task.timezone,
+          retryDelayMs: task.retryDelayMs,
+          overlapPolicy: task.overlapPolicy,
+          endsAt: task.endsAt,
+          maxRuns: task.maxRuns,
           payload: task.payload,
           recipients: task.recipients,
           notifyOn: task.notifyOn,
           webhookUrl: task.webhookUrl,
+          systemUserId: task.systemUserId ?? "",
         }}
         submitLabel="保存修改"
         busyLabel="保存中…"

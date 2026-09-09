@@ -12,6 +12,12 @@ const TASK_SELECT = {
   name: true,
   cron: true,
   scheduleIntervalSeconds: true,
+  runAt: true,
+  timezone: true,
+  retryDelayMs: true,
+  overlapPolicy: true,
+  endsAt: true,
+  maxRuns: true,
   taskType: true,
   payload: true,
   payloadSecrets: true,
@@ -22,6 +28,7 @@ const TASK_SELECT = {
   recipients: true,
   notifyOn: true,
   version: true,
+  systemUserId: true,
   nextRunAt: true,
   ownerTokenId: true,
   createdAt: true,
@@ -45,6 +52,8 @@ export interface TaskListFilters {
   q?: string;
   /** 仅显示指定 owner token 创建的任务（租户内按 token 隔离视图）。 */
   ownerTokenId?: string;
+  /** 按系统内用户筛选任务（外部接入系统具体用户）。 */
+  systemUserId?: string;
 }
 
 function whereFor(tenantId: string, filters: TaskListFilters): Prisma.TaskWhereInput {
@@ -56,6 +65,7 @@ function whereFor(tenantId: string, filters: TaskListFilters): Prisma.TaskWhereI
       : {}),
     ...(filters.q ? { name: { contains: filters.q } } : {}),
     ...(filters.ownerTokenId ? { ownerTokenId: filters.ownerTokenId } : {}),
+    ...(filters.systemUserId ? { systemUserId: filters.systemUserId } : {}),
   };
 }
 
@@ -88,6 +98,7 @@ export async function listAllTasks(filters: TaskListFilters) {
       : {}),
     ...(filters.q ? { name: { contains: filters.q } } : {}),
     ...(filters.ownerTokenId ? { ownerTokenId: filters.ownerTokenId } : {}),
+    ...(filters.systemUserId ? { systemUserId: filters.systemUserId } : {}),
   };
   // 同上：只读列表不走 $transaction，避免 P2028 事务启动超时。
   const [rows, total] = await Promise.all([

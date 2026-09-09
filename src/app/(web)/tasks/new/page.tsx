@@ -34,6 +34,14 @@ export default function NewTaskPage() {
       ...(values.scheduleIntervalSeconds
         ? { scheduleIntervalSeconds: values.scheduleIntervalSeconds }
         : {}),
+      ...(values.runAt ? { runAt: values.runAt } : {}),
+      ...(values.timezone ? { timezone: values.timezone } : {}),
+      ...(values.retryDelayMs != null ? { retryDelayMs: values.retryDelayMs } : {}),
+      ...(values.overlapPolicy && values.overlapPolicy !== "skip"
+        ? { overlapPolicy: values.overlapPolicy }
+        : {}),
+      ...(values.endsAt ? { endsAt: values.endsAt } : {}),
+      ...(values.maxRuns ? { maxRuns: values.maxRuns } : {}),
       taskType: values.taskType,
       payload:
         values.taskType === "http"
@@ -46,6 +54,7 @@ export default function NewTaskPage() {
             }
           : {},
       ...(values.webhookUrl ? { webhookUrl: values.webhookUrl } : {}),
+      ...(values.systemUserId ? { systemUserId: values.systemUserId } : {}),
       recipients: values.recipients,
       notifyOn: values.notifyOn,
     });

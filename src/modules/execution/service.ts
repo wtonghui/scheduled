@@ -1,22 +1,22 @@
-import type { Prisma } from "@prisma/client";
-import { prisma } from "@/lib/db";
 import { withTimeout } from "@/lib/concurrency";
-import { classifyError, jitteredDelayMs } from "@/lib/retry";
-import { TimeoutError, HttpError } from "@/lib/errors";
+import { prisma } from "@/lib/db";
+import { HttpError, TimeoutError } from "@/lib/errors";
 import { logger } from "@/lib/logger";
 import {
-  enqueueNotificationsFromRun,
-  type NotifyContext,
-  type RunSummary,
-} from "@/modules/notification/service";
-import {
-  taskRunsTotal,
+  deadLetterTotal,
   taskAttemptsTotal,
   taskDurationMs,
   taskInFlight,
-  deadLetterTotal,
+  taskRunsTotal,
 } from "@/lib/metrics";
-import { getExecutor, type TaskExecutorInput } from "./registry";
+import { classifyError, jitteredDelayMs } from "@/lib/retry";
+import {
+  type NotifyContext,
+  type RunSummary,
+  enqueueNotificationsFromRun,
+} from "@/modules/notification/service";
+import type { Prisma } from "@prisma/client";
+import { type TaskExecutorInput, getExecutor } from "./registry";
 
 /**
  * 执行生命周期（data-model.md 状态转移、FR-006/FR-007）。
@@ -32,12 +32,15 @@ export interface RunTaskDefinition {
   payloadSecrets: Uint8Array | null;
   timeoutMs: number;
   maxAttempts: number;
+  /** 同次调度内重试等待基线（毫秒）；缺省/null=默认退避（1s 起×2/30s 封顶，老任务行为不变） */
+  retryDelayMs?: number | null;
   tenantId: string;
   taskName: string;
   recipients: string[];
   notifyOn: string[];
   webhookUrl: string | null;
   webhookSecret: Uint8Array | null;
+  systemUserId?: string | null;
 }
 
 export interface RunOutcome {
@@ -51,10 +54,19 @@ async function createExecution(
   scheduledAt: Date,
   attempt: number,
   trigger: "scheduled" | "manual",
+  systemUserId?: string | null,
 ) {
   try {
     return await prisma.taskExecution.create({
-      data: { taskId, idempotencyKey, scheduledAt, attempt, trigger, status: "pending" },
+      data: {
+        taskId,
+        idempotencyKey,
+        scheduledAt,
+        attempt,
+        trigger,
+        status: "pending",
+        ...(systemUserId ? { systemUserId } : {}),
+      },
     });
   } catch (error) {
     // 并发重复领取 → 幂等复用既有行
@@ -71,7 +83,8 @@ async function createExecution(
 function serializeError(error: unknown): Prisma.InputJsonValue {
   const err = error as { message?: string; status?: number; code?: string } | null;
   return {
-    class: error instanceof TimeoutError ? "timeout" : error instanceof HttpError ? "http" : "error",
+    class:
+      error instanceof TimeoutError ? "timeout" : error instanceof HttpError ? "http" : "error",
     message: err?.message ?? String(error),
     ...(typeof err?.status === "number" ? { status: err.status } : {}),
     ...(typeof err?.code === "string" ? { code: err.code } : {}),
@@ -115,6 +128,7 @@ async function finalizeExecution(
       notifyOn: task.notifyOn ?? [],
       webhookUrl: task.webhookUrl ?? null,
       webhookSecretBytes: task.webhookSecret ?? null,
+      systemUserId: task.systemUserId ?? null,
     };
     const summary: RunSummary = {
       executionId,
@@ -135,7 +149,7 @@ export async function runTaskWithScheduledAt(
   task: RunTaskDefinition,
   scheduledAt: Date,
   trigger: "scheduled" | "manual",
-  opts: { executionId?: string } = {},
+  opts: { executionId?: string; externalSignal?: AbortSignal } = {},
 ): Promise<RunOutcome> {
   const executor = getExecutor(task.taskType);
   const input: TaskExecutorInput = {
@@ -156,7 +170,7 @@ export async function runTaskWithScheduledAt(
     const execution =
       opts.executionId && attempt === 1
         ? await prisma.taskExecution.findUnique({ where: { id: opts.executionId } })
-        : await createExecution(task.id, key, scheduledAt, attempt, trigger);
+        : await createExecution(task.id, key, scheduledAt, attempt, trigger, task.systemUserId);
 
     if (!execution) {
       throw new Error(`manual execution ${opts.executionId} not found`);
@@ -176,7 +190,13 @@ export async function runTaskWithScheduledAt(
     await prisma.taskExecution.update({ where: { id: execution.id }, data: { status: "running" } });
 
     try {
-      await withTimeout((signal) => executor({ ...input, attempt, signal }), task.timeoutMs);
+      // onProgress 由执行器在流式取得进展时调用 → withTimeout 重置空闲计时器（长流续命）；
+      // externalSignal 为进程级中止（如 shutdown 超时强杀）
+      await withTimeout(
+        (signal, onProgress) => executor({ ...input, attempt, signal, onProgress }),
+        task.timeoutMs,
+        opts.externalSignal,
+      );
       taskAttemptsTotal.inc({ status: "succeeded" });
       taskRunsTotal.inc({ status: "succeeded" });
       await finalizeExecution(
@@ -190,6 +210,16 @@ export async function runTaskWithScheduledAt(
         task,
         scheduledAt,
         null,
+      );
+      logger.info(
+        {
+          task_id: task.id,
+          execution_id: execution.id,
+          attempt,
+          status: "succeeded",
+          duration_ms: Date.now() - startedAt.getTime(),
+        },
+        "task run finished",
       );
       return { executionId: execution.id, status: "succeeded" };
     } catch (error) {
@@ -222,7 +252,7 @@ export async function runTaskWithScheduledAt(
       }
 
       if (attempt < task.maxAttempts) {
-        const delayMs = jitteredDelayMs(1000, 2, 30000, attempt - 1);
+        const delayMs = jitteredDelayMs(task.retryDelayMs ?? 1000, 2, 30000, attempt - 1);
         logger.info({ task_id: task.id, attempt, delayMs }, "task attempt failed, will retry");
         taskAttemptsTotal.inc({ status: terminal });
         await prisma.taskExecution.update({

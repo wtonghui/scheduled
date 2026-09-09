@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev:web": "next dev",
+    "dev:web": "next dev -p 4000",
     "dev:worker": "tsx watch worker/index.ts",
     "build": "next build",
     "start:web": "next start",
@@ -44,6 +44,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cron-parser": "^4.9.0",
+    "croner": "^10.0.1",
     "dotenv": "^17.4.2",
     "ipaddr.js": "^2.2.0",
     "lucide-react": "^1.33.0",

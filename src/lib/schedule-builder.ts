@@ -200,7 +200,7 @@ function weekdayList(value: string): number[] | null {
 
 /**
  * 5 段 cron → ScheduleSpec（buildSchedule 的逆映射，用于编辑时「回到结构化选择」回显）。
- * 无法用结构化器表达（6 段含秒、带月限制、日期与星期组合等）→ null。
+ * 无法用结构化器表达（6 段含秒、7 段含年、带月限制、日期与星期组合等）→ null。
  * 生成侧未覆盖的等价格式（如 `*` 分/时）按语义归一到结构化表达。
  */
 export function parseCronToSpec(cron: string): ScheduleSpec | null {
