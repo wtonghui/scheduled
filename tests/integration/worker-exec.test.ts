@@ -3,7 +3,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { prisma } from "../../src/lib/db";
 import { registerDefaultExecutors } from "../../src/modules/execution/register";
 import { runTaskWithScheduledAt } from "../../src/modules/execution/service";
-import { advanceMissedRuns, claimDueTasks } from "../../worker/scheduler";
+import { createRunner } from "../../worker/runner";
+import {
+  advanceMissedRuns,
+  claimDueTasks,
+  reconcileOrphanExecutions,
+  renewTaskLeases,
+} from "../../worker/scheduler";
 import { cleanupTenant, createTestTask, createTestTenant, createTestToken } from "./helpers";
 
 /**
@@ -44,6 +50,14 @@ function startServer(): Promise<string> {
           res.writeHead(200);
           res.end("ok");
         }, 3000);
+        return;
+      }
+      if (req.url?.startsWith("/sse")) {
+        // text/event-stream：分多个 chunk 逐步推送（模拟 LLM agent 流式输出）
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('data: {"step":1}\n\n');
+        setTimeout(() => res.write('data: {"step":2}\n\n'), 10);
+        setTimeout(() => res.end("data: [DONE]\n\n"), 20);
         return;
       }
       res.writeHead(418);
@@ -135,7 +149,7 @@ describe("worker execution", () => {
     );
     expect(outcome.status).toBe("succeeded");
     const hit = requests.find((r) => r.url.startsWith("/ok"));
-    const u = new URL(hit!.url!, baseUrl);
+    const u = new URL(hit?.url ?? "", baseUrl);
     expect(u.searchParams.get("existing")).toBe("1"); // 原 url query 保留
     expect(u.searchParams.get("page")).toBe("2"); // params 字符串
     expect(u.searchParams.get("verbose")).toBe("true"); // boolean → "true"
@@ -251,5 +265,113 @@ describe("worker execution", () => {
     ]);
     expect(a.status).toBe("succeeded");
     expect(b.status).toBe("succeeded");
+  });
+
+  it("streaming (SSE) task succeeds and enqueues the email only after the stream is fully consumed", async () => {
+    const task = await createTestTask(tenantId, { taskType: "noop" });
+    const outcome = await runTaskWithScheduledAt(
+      taskFor(
+        task.id,
+        { url: `${baseUrl}/sse` },
+        { tenantId, recipients: ["e2e-stream@example.com"], notifyOn: ["succeeded"] },
+      ),
+      new Date(),
+      "scheduled",
+    );
+    expect(outcome.status).toBe("succeeded");
+    // 流完整消费完毕后终态才写入 → email outbox 随之落单（run_id 关联执行）
+    const email = await prisma.emailLog.findFirst({ where: { runId: outcome.executionId } });
+    expect(email).not.toBeNull();
+    expect(email?.status).toBe("pending");
+  });
+
+  it("runner.submit returns immediately while a long task still runs (scheduler decoupled)", async () => {
+    const task = await createTestTask(tenantId, { taskType: "noop" });
+    const r = createRunner(2);
+    const started = Date.now();
+    r.submit([
+      {
+        kind: "scheduled",
+        task: taskFor(task.id, { url: `${baseUrl}/slow` }, { timeoutMs: 5000, maxAttempts: 1 }),
+        scheduledAt: new Date(),
+      },
+    ]);
+    expect(Date.now() - started).toBeLessThan(500); // 只入池，不等完成
+    expect(r.inFlightCount).toBe(1);
+    await r.drain(6000);
+    expect(r.inFlightCount).toBe(0);
+  }, 15000);
+
+  it("freeSlots reflects pool occupancy (claim bounded by capacity)", async () => {
+    const task = await createTestTask(tenantId, { taskType: "noop" });
+    const r = createRunner(1);
+    expect(r.freeSlots).toBe(1);
+    r.submit([
+      {
+        kind: "scheduled",
+        task: taskFor(task.id, { url: `${baseUrl}/slow` }, { timeoutMs: 5000, maxAttempts: 1 }),
+        scheduledAt: new Date(),
+      },
+    ]);
+    expect(r.freeSlots).toBe(0);
+    await r.drain(6000);
+    expect(r.freeSlots).toBe(1);
+  }, 15000);
+
+  it("renews lease for long-running tasks so another instance cannot re-claim", async () => {
+    const task = await createTestTask(tenantId, { nextRunAt: new Date(Date.now() - 5000) });
+    const claimed = await claimDueTasks("wk-lease", 1, 10, true);
+    expect(claimed.some((c) => c.task.id === task.id)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 1100)); // 1s 租约已过期
+    const renewed = await renewTaskLeases([task.id], "wk-lease", 60);
+    expect(renewed).toBe(1);
+    const row = await prisma.task.findUnique({ where: { id: task.id } });
+    expect(row?.claimedUntil?.getTime() ?? 0).toBeGreaterThan(Date.now());
+  }, 10000);
+
+  it("re-claims stale scheduled pending executions after restart (补跑, not double-run fresh ones)", async () => {
+    const task = await createTestTask(tenantId, { taskType: "noop" });
+    const exec = await prisma.taskExecution.create({
+      data: {
+        taskId: task.id,
+        idempotencyKey: `${task.id}:restart:a1`,
+        scheduledAt: new Date(Date.now() - 60_000),
+        attempt: 1,
+        trigger: "scheduled",
+        status: "pending",
+      },
+    });
+    // 回拨 created_at 越过补跑宽限期（模拟死 worker 遗留的 pending）
+    await prisma.$executeRaw`UPDATE task_execution SET created_at = DATE_SUB(NOW(), INTERVAL 60 SECOND) WHERE id = ${exec.id}`;
+    const claimed = await claimDueTasks("wk-bu", 60, 10, true);
+    const hit = claimed.find((c) => c.kind === "manual" && c.executionId === exec.id);
+    expect(hit).toBeDefined();
+  });
+
+  it("reconciles orphaned running executions whose task lease expired (no re-run)", async () => {
+    const task = await createTestTask(tenantId, { nextRunAt: new Date(Date.now() - 5000) });
+    const exec = await prisma.taskExecution.create({
+      data: {
+        taskId: task.id,
+        idempotencyKey: `${task.id}:orphan:a1`,
+        scheduledAt: new Date(Date.now() - 60_000),
+        attempt: 1,
+        trigger: "scheduled",
+        status: "running",
+        startedAt: new Date(Date.now() - 120_000),
+      },
+    });
+    // 模拟死 worker：task 租约早已过期
+    await prisma.task.update({
+      where: { id: task.id },
+      data: { claimedBy: "dead-worker", claimedUntil: new Date(Date.now() - 30_000) },
+    });
+    const handled = await reconcileOrphanExecutions();
+    expect(handled).toBeGreaterThanOrEqual(1);
+    const row = await prisma.taskExecution.findUnique({ where: { id: exec.id } });
+    expect(row?.status).toBe("failed");
+    const taskAfter = await prisma.task.findUnique({ where: { id: task.id } });
+    expect(taskAfter?.claimedBy).toBeNull();
+    expect(taskAfter?.claimedUntil).toBeNull();
   });
 });

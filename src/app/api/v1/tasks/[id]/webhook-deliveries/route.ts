@@ -1,7 +1,7 @@
-import type { NextRequest } from "next/server";
+import { fail, ok } from "@/lib/api-envelope";
 import { requireAuth } from "@/modules/auth/middleware";
 import { listWebhookDeliveries } from "@/modules/notification/repository";
-import { ok, fail } from "@/lib/api-envelope";
+import type { NextRequest } from "next/server";
 
 /**
  * 单任务 Webhook 投递历史（contracts/api.md W1）。
@@ -22,7 +22,14 @@ export const GET = requireAuth({ scopes: ["tasks:read"] })(
         100,
         Math.max(1, Number(searchParams.get("pageSize") ?? "20") || 20),
       );
-      const { rows, total } = await listWebhookDeliveries(auth.tenantId, id, page, pageSize);
+      const systemUserId = searchParams.get("system_user_id") ?? undefined;
+      const { rows, total } = await listWebhookDeliveries(
+        auth.tenantId,
+        id,
+        page,
+        pageSize,
+        systemUserId,
+      );
       return ok(rows, { page, pageSize, total });
     } catch (error) {
       return fail(error);

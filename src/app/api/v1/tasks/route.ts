@@ -26,6 +26,7 @@ export const GET = optionalAuth(async (req: NextRequest, auth): Promise<Response
     const q = searchParams.get("q") ?? undefined;
     const mine = searchParams.get("mine") === "true";
     const ownerToken = searchParams.get("owner") === "token";
+    const systemUserId = searchParams.get("system_user_id") ?? undefined;
 
     const query = {
       page: Number.isFinite(page) ? page : 1,
@@ -35,6 +36,7 @@ export const GET = optionalAuth(async (req: NextRequest, auth): Promise<Response
       q,
       // 仅登录时按当前 token 收敛；未登录忽略 owner=token（保持全量只读）
       ownerTokenId: ownerToken && auth ? auth.tokenId : undefined,
+      systemUserId,
     };
     // ?mine=true + 已登录 → 仅本租户（全部可写）。
     // 否则（匿名或登录默认）→ 跨租户全量，按 viewer 标注 writable。
@@ -52,7 +54,8 @@ export const POST = requireAuth({ scopes: ["tasks:write"] })(
   async (req: NextRequest, auth): Promise<Response> => {
     try {
       const body = await req.json();
-      const task = await taskService.create(auth.tenantId, auth.tokenId, body);
+      const systemUserId = (req.headers.get("x-system-user-id") as string | null) ?? body.systemUserId ?? undefined;
+      const task = await taskService.create(auth.tenantId, auth.tokenId, { ...body, ...(systemUserId ? { systemUserId } : {}) });
       return okCreated(task);
     } catch (error) {
       return fail(error);

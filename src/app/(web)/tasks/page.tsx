@@ -13,6 +13,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { EmptyState } from "@/components/ui/empty-state";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
@@ -55,6 +56,7 @@ export default function TasksPage() {
   const [enabledFilter, setEnabledFilter] = useState("all");
   const [mineOnly, setMineOnly] = useState(false); // 只看我的（租户）
   const [ownerTokenOnly, setOwnerTokenOnly] = useState(false); // 只看当前 api（token 隔离）
+  const [systemUserFilter, setSystemUserFilter] = useState(""); // 按系统内用户筛选
   const { toast } = useToast();
   const confirm = useConfirm();
 
@@ -66,6 +68,7 @@ export default function TasksPage() {
       if (enabledFilter !== "all") params.set("enabled", enabledFilter);
       if (mineOnly && isAuthed) params.set("mine", "true");
       if (ownerTokenOnly && isAuthed) params.set("owner", "token");
+      if (systemUserFilter.trim()) params.set("system_user_id", systemUserFilter.trim());
       const q = params.toString() ? `?${params.toString()}` : "";
       const { data, meta } = await api.get<TaskItem[]>(`/api/v1/tasks${q}`);
       setTasks(data);
@@ -75,7 +78,7 @@ export default function TasksPage() {
     } finally {
       setLoading(false);
     }
-  }, [enabledFilter, mineOnly, ownerTokenOnly, isAuthed]);
+  }, [enabledFilter, mineOnly, ownerTokenOnly, systemUserFilter, isAuthed]);
 
   useEffect(() => {
     load();
@@ -184,6 +187,16 @@ export default function TasksPage() {
               </TooltipTrigger>
               <TooltipContent>仅显示当前登录 API token 自己创建的任务</TooltipContent>
             </Tooltip>
+            <div className="flex items-center gap-2">
+              <Label htmlFor="system-user-filter" className="text-[13px]">系统用户</Label>
+              <Input
+                id="system-user-filter"
+                value={systemUserFilter}
+                onChange={(e) => setSystemUserFilter(e.target.value)}
+                placeholder="按系统内用户筛选"
+                className="w-48"
+              />
+            </div>
           </>
         ) : (
           <Tooltip>
@@ -254,6 +267,11 @@ export default function TasksPage() {
                 >
                   {task.name}
                 </Link>
+                {(task as any).systemUserId && (
+                  <span className="ml-1.5 inline-flex items-center rounded-full bg-surface-hover px-1.5 py-0.5 text-[10px] font-medium text-text-faint">
+                    {(task as any).systemUserId}
+                  </span>
+                )}
               </div>
               <div className="truncate font-mono text-xs text-text-muted">
                 {scheduleLabel(task)}

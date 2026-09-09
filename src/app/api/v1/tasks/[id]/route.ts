@@ -1,7 +1,7 @@
-import type { NextRequest } from "next/server";
-import { requireAuth, optionalAuth } from "@/modules/auth/middleware";
+import { fail, noContent, ok } from "@/lib/api-envelope";
+import { optionalAuth, requireAuth } from "@/modules/auth/middleware";
 import * as taskService from "@/modules/task/service";
-import { ok, noContent, fail } from "@/lib/api-envelope";
+import type { NextRequest } from "next/server";
 
 /**
  * 单任务资源（contracts/api.md §3-5）。
@@ -14,25 +14,25 @@ export const runtime = "nodejs";
 
 type Ctx = { params: Promise<{ id: string }> };
 
-export const GET = optionalAuth(
-  async (_req: NextRequest, auth, ctx: Ctx): Promise<Response> => {
-    try {
-      const { id } = await ctx.params;
-      // 跨租户只读详情：带 token 则据其租户标注 writable（本租户=可写）。
-      const task = await taskService.getAny(id, auth?.tenantId ?? null);
-      return ok(task);
-    } catch (error) {
-      return fail(error);
-    }
-  },
-);
+export const GET = optionalAuth(async (_req: NextRequest, auth, ctx: Ctx): Promise<Response> => {
+  try {
+    const { id } = await ctx.params;
+    // 跨租户只读详情：带 token 则据其租户标注 writable（本租户=可写）。
+    const task = await taskService.getAny(id, auth?.tenantId ?? null);
+    return ok(task);
+  } catch (error) {
+    return fail(error);
+  }
+});
 
 export const PATCH = requireAuth({ scopes: ["tasks:write"] })(
   async (req: NextRequest, auth, ctx: Ctx): Promise<Response> => {
     try {
       const { id } = await ctx.params;
       const body = await req.json();
-      const task = await taskService.update(auth.tenantId, id, body);
+      const systemUserIdHeader = req.headers.get("x-system-user-id") as string | null;
+      const updateBody = systemUserIdHeader ? { ...body, systemUserId: systemUserIdHeader } : body;
+      const task = await taskService.update(auth.tenantId, id, updateBody);
       return ok(task);
     } catch (error) {
       return fail(error);

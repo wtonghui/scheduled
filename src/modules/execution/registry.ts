@@ -12,6 +12,11 @@ export interface TaskExecutorInput {
   };
   attempt: number;
   signal: AbortSignal;
+  /**
+   * 进度心跳：执行器取得进展（如流式响应收到 chunk）时调用，
+   * 重置 withTimeout 的空闲计时器——流式长请求不被总时长误杀。
+   */
+  onProgress?: () => void;
 }
 
 export type TaskExecutor = (input: TaskExecutorInput) => Promise<{ result?: unknown }>;

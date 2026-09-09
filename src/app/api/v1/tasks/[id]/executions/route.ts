@@ -23,8 +23,9 @@ export const GET = optionalAuth(
         100,
         Math.max(1, Number(searchParams.get("pageSize") ?? "20") || 20),
       );
+      const systemUserId = searchParams.get("system_user_id") ?? undefined;
 
-      const { rows, total } = await listByTaskAny(id, page, pageSize);
+      const { rows, total } = await listByTaskAny(id, page, pageSize, systemUserId);
       return ok(rows, { page, pageSize, total });
     } catch (error) {
       return fail(error);

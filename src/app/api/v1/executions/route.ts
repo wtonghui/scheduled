@@ -21,8 +21,9 @@ export const GET = requireAuth({ scopes: ["tasks:read"] })(
       );
       const taskId = searchParams.get("taskId") ?? undefined;
       const status = searchParams.get("status") ?? undefined;
+      const systemUserId = searchParams.get("system_user_id") ?? undefined;
 
-      const { rows, total } = await listAll(auth.tenantId, page, pageSize, taskId, status);
+      const { rows, total } = await listAll(auth.tenantId, page, pageSize, taskId, status, systemUserId);
       return ok(rows, { page, pageSize, total });
     } catch (error) {
       return fail(error);

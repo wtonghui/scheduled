@@ -20,7 +20,8 @@ export const GET = requireAuth({ scopes: ["tasks:read"] })(
       );
       const runId = searchParams.get("runId") ?? undefined;
       const status = searchParams.get("status") ?? undefined;
-      const { rows, total } = await listEmailLog(auth.tenantId, page, pageSize, runId, status);
+      const systemUserId = searchParams.get("system_user_id") ?? undefined;
+      const { rows, total } = await listEmailLog(auth.tenantId, page, pageSize, runId, status, systemUserId);
       return ok(rows, { page, pageSize, total });
     } catch (error) {
       return fail(error);

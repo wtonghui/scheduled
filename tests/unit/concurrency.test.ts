@@ -86,4 +86,49 @@ describe("withTimeout", () => {
       }, 1000),
     ).rejects.toThrow("boom");
   });
+
+  it("keeps alive while fn reports progress beyond the nominal deadline (idle timeout)", async () => {
+    // 总耗时 5×60ms=300ms > 100ms，但每步都续命 → 应 resolve
+    await expect(
+      withTimeout(async (_signal, onProgress) => {
+        for (let i = 0; i < 5; i += 1) {
+          await new Promise((r) => setTimeout(r, 60));
+          onProgress?.();
+        }
+        return "streamed done";
+      }, 100),
+    ).resolves.toBe("streamed done");
+  });
+
+  it("times out when fn stalls without progress for the idle window", async () => {
+    // 续命两次后停摆，无进展超过 50ms → TimeoutError
+    await expect(
+      withTimeout(async (_signal, onProgress) => {
+        onProgress?.();
+        await new Promise((r) => setTimeout(r, 30));
+        onProgress?.();
+        await new Promise((r) => setTimeout(r, 300)); // 停摆
+        return "too late";
+      }, 50),
+    ).rejects.toBeInstanceOf(TimeoutError);
+  });
+
+  it("aborts and rejects when the external signal fires (shutdown force-kill)", async () => {
+    const controller = new AbortController();
+    const p = withTimeout(
+      () => new Promise<never>(() => {}), // 永不完成；只有外部信号能终止
+      10_000,
+      controller.signal,
+    );
+    controller.abort();
+    await expect(p).rejects.toThrow(/external signal/);
+  });
+
+  it("rejects immediately when the external signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(withTimeout(async () => "done", 1000, controller.signal)).rejects.toThrow(
+      /external signal/,
+    );
+  });
 });

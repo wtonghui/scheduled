@@ -37,11 +37,13 @@ export async function listEmailLog(
   pageSize: number,
   runId?: string,
   status?: string,
+  systemUserId?: string,
 ) {
   const where: Prisma.EmailLogWhereInput = {
     tenantId,
     ...(runId ? { runId } : {}),
     ...(status ? { status: status as Prisma.EmailLogWhereInput["status"] } : {}),
+    ...(systemUserId ? { systemUserId } : {}),
   };
   const [rows, total] = await prisma.$transaction([
     prisma.emailLog.findMany({
@@ -61,6 +63,7 @@ export async function listWebhookDeliveries(
   taskId: string,
   page: number,
   pageSize: number,
+  systemUserId?: string,
 ) {
   // webhook_delivery 通过 run_id 关联 execution → task（跨租户 404）
   const task = await prisma.task.findFirst({
@@ -77,6 +80,7 @@ export async function listWebhookDeliveries(
   const where: Prisma.WebhookDeliveryWhereInput = {
     tenantId,
     runId: { in: executions.map((e) => e.id) },
+    ...(systemUserId ? { systemUserId } : {}),
   };
   const [rows, total] = await prisma.$transaction([
     prisma.webhookDelivery.findMany({

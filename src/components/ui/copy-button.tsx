@@ -31,6 +31,7 @@ function CopyButton({ value, label = "复制" }: { value: string; label?: string
     timer.current = setTimeout(() => setCopied(false), 1500);
   };
 
+
   return (
     <Button type="button" variant="secondary" size="sm" onClick={copy}>
       {copied ? <Check className="text-ok" /> : <Copy />}

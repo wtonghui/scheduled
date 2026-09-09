@@ -16,6 +16,7 @@ const EXECUTION_SELECT = {
   durationMs: true,
   error: true,
   trigger: true,
+  systemUserId: true,
   createdAt: true,
 } satisfies Prisma.TaskExecutionSelect;
 
@@ -37,8 +38,8 @@ export async function listByTask(tenantId: string, taskId: string, page: number,
 /**
  * 跨租户只读：按 taskId 查执行历史（匿名浏览）。无 tenant 过滤。
  */
-export async function listByTaskAny(taskId: string, page: number, pageSize: number) {
-  const where = { taskId } satisfies Prisma.TaskExecutionWhereInput;
+export async function listByTaskAny(taskId: string, page: number, pageSize: number, systemUserId?: string) {
+  const where = { taskId, ...(systemUserId ? { systemUserId } : {}) } satisfies Prisma.TaskExecutionWhereInput;
   const [rows, total] = await prisma.$transaction([
     prisma.taskExecution.findMany({
       where,
@@ -58,11 +59,13 @@ export async function listAll(
   pageSize: number,
   taskId?: string,
   status?: string,
+  systemUserId?: string,
 ) {
   const where: Prisma.TaskExecutionWhereInput = {
     task: { tenantId },
     ...(taskId ? { taskId } : {}),
     ...(status ? { status: status as Prisma.TaskExecutionWhereInput["status"] } : {}),
+    ...(systemUserId ? { systemUserId } : {}),
   };
   const [rows, total] = await prisma.$transaction([
     prisma.taskExecution.findMany({

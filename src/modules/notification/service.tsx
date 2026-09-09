@@ -22,6 +22,8 @@ export interface NotifyContext {
   webhookUrl: string | null;
   /** AES 加密后的 HMAC 密钥快照（中继解密后验签；任务被删仍可投递）。 */
   webhookSecretBytes: Uint8Array | null;
+  /** 系统内用户标识（外部接入系统具体用户），用于通知归属追溯。 */
+  systemUserId?: string | null;
 }
 
 export interface RunSummary {
@@ -97,6 +99,7 @@ export async function enqueueNotificationsFromRun(
           text,
           status: "pending",
           maxAttempts: 5,
+          ...(ctx.systemUserId ? { systemUserId: ctx.systemUserId } : {}),
         },
       });
     }
@@ -121,6 +124,7 @@ export async function enqueueNotificationsFromRun(
           webhookSecret: ctx.webhookSecretBytes ? new Uint8Array(ctx.webhookSecretBytes) : null,
           status: "pending",
           maxAttempts: 5,
+          ...(ctx.systemUserId ? { systemUserId: ctx.systemUserId } : {}),
         },
       });
     }
