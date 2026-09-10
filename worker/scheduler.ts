@@ -41,6 +41,9 @@ interface DueRow {
   notifyOn: string;
   webhookUrl: string | null;
   webhookSecret: Uint8Array | string | null;
+  emailSubjectTemplate: string | null;
+  emailBodyTemplate: string | null;
+  emailAttachmentUrlTemplate: string | null;
 }
 
 function parseJsonColumn(value: unknown, fallback: unknown = {}): unknown {
@@ -79,6 +82,9 @@ function toTaskDefinition(row: DueRow): RunTaskDefinition {
     notifyOn: (parseJsonColumn(row.notifyOn, []) as string[]) ?? [],
     webhookUrl: row.webhookUrl,
     webhookSecret: toBytes(row.webhookSecret),
+    emailSubjectTemplate: row.emailSubjectTemplate,
+    emailBodyTemplate: row.emailBodyTemplate,
+    emailAttachmentUrlTemplate: row.emailAttachmentUrlTemplate,
   };
 }
 
@@ -89,7 +95,10 @@ const TASK_COLUMNS = Prisma.sql`
   retry_delay_ms AS retryDelayMs,
   payload, payload_secrets AS payloadSecrets, next_run_at AS nextRunAt,
   tenant_id AS tenantId, name AS taskName, recipients, notify_on AS notifyOn,
-  webhook_url AS webhookUrl, webhook_secret AS webhookSecret
+  webhook_url AS webhookUrl, webhook_secret AS webhookSecret,
+  email_subject_template AS emailSubjectTemplate,
+  email_body_template AS emailBodyTemplate,
+  email_attachment_url_template AS emailAttachmentUrlTemplate
 `;
 
 /** 已消耗的调度次数：attempt=1 且 trigger 为调度触发的行；run-now/重试行/跳过行不计（D3/D4）。

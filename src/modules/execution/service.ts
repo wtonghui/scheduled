@@ -41,6 +41,12 @@ export interface RunTaskDefinition {
   webhookUrl: string | null;
   webhookSecret: Uint8Array | null;
   systemUserId?: string | null;
+  /** 邮件标题模板；null=默认标题 */
+  emailSubjectTemplate?: string | null;
+  /** 邮件正文模板（HTML）；null=默认 React Email */
+  emailBodyTemplate?: string | null;
+  /** 附件 URL 模板；null=无附件 */
+  emailAttachmentUrlTemplate?: string | null;
 }
 
 export interface RunOutcome {
@@ -106,6 +112,7 @@ async function finalizeExecution(
   task: RunTaskDefinition,
   scheduledAt: Date,
   errorMessage: string | null,
+  executorResult?: unknown,
 ): Promise<void> {
   await prisma.$transaction(async (tx) => {
     await tx.taskExecution.update({
@@ -129,6 +136,9 @@ async function finalizeExecution(
       webhookUrl: task.webhookUrl ?? null,
       webhookSecretBytes: task.webhookSecret ?? null,
       systemUserId: task.systemUserId ?? null,
+      emailSubjectTemplate: task.emailSubjectTemplate ?? null,
+      emailBodyTemplate: task.emailBodyTemplate ?? null,
+      emailAttachmentUrlTemplate: task.emailAttachmentUrlTemplate ?? null,
     };
     const summary: RunSummary = {
       executionId,
@@ -140,6 +150,7 @@ async function finalizeExecution(
       finishedAt: fields.finishedAt,
       durationMs: fields.durationMs,
       errorMessage: errorMessage ?? null,
+      result: executorResult,
     };
     await enqueueNotificationsFromRun(notifyCtx, summary, tx);
   });
@@ -192,7 +203,7 @@ export async function runTaskWithScheduledAt(
     try {
       // onProgress 由执行器在流式取得进展时调用 → withTimeout 重置空闲计时器（长流续命）；
       // externalSignal 为进程级中止（如 shutdown 超时强杀）
-      await withTimeout(
+      const execResult = await withTimeout(
         (signal, onProgress) => executor({ ...input, attempt, signal, onProgress }),
         task.timeoutMs,
         opts.externalSignal,
@@ -210,6 +221,7 @@ export async function runTaskWithScheduledAt(
         task,
         scheduledAt,
         null,
+        execResult?.result,
       );
       logger.info(
         {

@@ -97,6 +97,9 @@ export const CreateTaskSchema = z
       .min(1, "at least one recipient"),
     notifyOn: z.array(NotifyOnSchema).default(["succeeded", "failed"]),
     webhookUrl: z.string().url().optional(),
+    emailSubjectTemplate: z.string().trim().max(255).optional(),
+    emailBodyTemplate: z.string().trim().max(10_000).optional(),
+    emailAttachmentUrlTemplate: z.string().trim().max(512).optional(),
     systemUserId: z.string().trim().max(191).optional(),
   })
   .refine(
@@ -140,6 +143,9 @@ export const UpdateTaskSchema = z
     recipients: z.array(z.string().email("invalid recipient email")).min(1).optional(),
     notifyOn: z.array(NotifyOnSchema).optional(),
     webhookUrl: z.string().url().nullable().optional(),
+    emailSubjectTemplate: z.string().trim().max(255).nullable().optional(),
+    emailBodyTemplate: z.string().trim().max(10_000).nullable().optional(),
+    emailAttachmentUrlTemplate: z.string().trim().max(512).nullable().optional(),
     systemUserId: z.string().trim().max(191).nullable().optional(),
     version: z.number().int().min(1),
   })

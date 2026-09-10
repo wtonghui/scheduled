@@ -33,6 +33,9 @@ export interface TaskInitial {
   overlapPolicy: string;
   endsAt: string | null;
   maxRuns: number | null;
+  emailSubjectTemplate: string | null;
+  emailBodyTemplate: string | null;
+  emailAttachmentUrlTemplate: string | null;
   payload: Record<string, unknown>;
   recipients: string[];
   notifyOn: string[];
@@ -57,6 +60,12 @@ export interface TaskFormValues {
   endsAt?: string;
   /** 总次数上限（仅重复调度） */
   maxRuns?: number;
+  /** 邮件标题模板；空=默认标题 */
+  emailSubjectTemplate?: string;
+  /** 邮件正文模板（HTML）；空=默认 React Email 模板 */
+  emailBodyTemplate?: string;
+  /** 附件 URL 模板（{xxx} 占位）；空=无附件 */
+  emailAttachmentUrlTemplate?: string;
   taskType: "http" | "noop";
   url: string;
   method: string;
@@ -163,6 +172,13 @@ export default function TaskForm({
   const [maxRuns, setMaxRuns] = useState(() =>
     initial?.maxRuns != null ? String(initial.maxRuns) : "",
   );
+  const [emailSubjectTemplate, setEmailSubjectTemplate] = useState(
+    initial?.emailSubjectTemplate ?? "",
+  );
+  const [emailBodyTemplate, setEmailBodyTemplate] = useState(initial?.emailBodyTemplate ?? "");
+  const [emailAttachmentUrlTemplate, setEmailAttachmentUrlTemplate] = useState(
+    initial?.emailAttachmentUrlTemplate ?? "",
+  );
 
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -255,6 +271,9 @@ export default function TaskForm({
       overlapPolicy: scheduleKind === "once" ? undefined : overlapPolicy,
       endsAt: endsAtIso,
       maxRuns: maxRunsNum,
+      emailSubjectTemplate: emailSubjectTemplate.trim() || undefined,
+      emailBodyTemplate: emailBodyTemplate.trim() || undefined,
+      emailAttachmentUrlTemplate: emailAttachmentUrlTemplate.trim() || undefined,
       taskType: form.taskType,
       url: form.url,
       method: form.method,
@@ -515,6 +534,42 @@ export default function TaskForm({
               onChange={(e) => set("webhookUrl", e.target.value)}
               placeholder="https://your-server.example.com/hook"
               className="mt-1.5"
+            />
+          </div>
+          <div className="col-span-2 mt-4">
+            <Label htmlFor="task-email-subject">
+              邮件标题模板（可空=默认标题。用 {`{字段名}`} 从响应 data 取值）
+            </Label>
+            <Input
+              id="task-email-subject"
+              value={emailSubjectTemplate}
+              onChange={(e) => setEmailSubjectTemplate(e.target.value)}
+              placeholder="如：任务完成 — {rowCount} 行"
+              className="mt-1.5 font-mono text-xs"
+            />
+          </div>
+          <div className="col-span-2 mt-4">
+            <Label htmlFor="task-email-body">
+              邮件正文模板（可空=默认模板。HTML，用 {`{字段名}`} 取值）
+            </Label>
+            <Textarea
+              id="task-email-body"
+              value={emailBodyTemplate}
+              onChange={(e) => setEmailBodyTemplate(e.target.value)}
+              placeholder={'如：共 {rowCount} 行<br><a href="{fileUrl}">下载文件</a>'}
+              className="mt-1.5 font-mono text-xs"
+            />
+          </div>
+          <div className="col-span-2 mt-4">
+            <Label htmlFor="task-email-attachment">
+              附件 URL 模板（可空=无附件。渲染后 relay 下载并附加到邮件）
+            </Label>
+            <Input
+              id="task-email-attachment"
+              value={emailAttachmentUrlTemplate}
+              onChange={(e) => setEmailAttachmentUrlTemplate(e.target.value)}
+              placeholder="如：{fileUrl}"
+              className="mt-1.5 font-mono text-xs"
             />
           </div>
           <div className="col-span-2 mt-4">

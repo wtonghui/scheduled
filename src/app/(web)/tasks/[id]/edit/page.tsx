@@ -28,6 +28,9 @@ interface TaskDetail {
   overlapPolicy: string;
   endsAt: string | null;
   maxRuns: number | null;
+  emailSubjectTemplate: string | null;
+  emailBodyTemplate: string | null;
+  emailAttachmentUrlTemplate: string | null;
   taskType: "http" | "noop";
   payload: Record<string, unknown>;
   enabled: boolean;
@@ -117,6 +120,9 @@ export default function EditTaskPage() {
       ...(values.overlapPolicy ? { overlapPolicy: values.overlapPolicy } : {}),
       endsAt: values.endsAt ?? null,
       maxRuns: values.maxRuns ?? null,
+      emailSubjectTemplate: values.emailSubjectTemplate ?? null,
+      emailBodyTemplate: values.emailBodyTemplate ?? null,
+      emailAttachmentUrlTemplate: values.emailAttachmentUrlTemplate ?? null,
       taskType: values.taskType,
       payload:
         values.taskType === "http"
@@ -181,6 +187,9 @@ export default function EditTaskPage() {
           overlapPolicy: task.overlapPolicy,
           endsAt: task.endsAt,
           maxRuns: task.maxRuns,
+          emailSubjectTemplate: task.emailSubjectTemplate,
+          emailBodyTemplate: task.emailBodyTemplate,
+          emailAttachmentUrlTemplate: task.emailAttachmentUrlTemplate,
           payload: task.payload,
           recipients: task.recipients,
           notifyOn: task.notifyOn,

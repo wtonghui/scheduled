@@ -8,6 +8,12 @@ import { SmtpMailService } from "./smtp-mail.service";
  * 适配器：smtp/http/pickup/json 由 MAIL_PROVIDER 选择（v1 默认 json，Phase 5 补充适配器）。
  */
 
+export interface MailAttachment {
+  filename: string;
+  content: Buffer;
+  contentType?: string;
+}
+
 export interface MailRequest {
   to: string[];
   cc?: string[];
@@ -20,6 +26,8 @@ export interface MailRequest {
   headers?: Record<string, string>;
   /** = run_id（幂等键表面） */
   externalRef?: string;
+  /** 附件（relay 从 attachment_url 下载后填入；SMTP 适配器透传给 nodemailer） */
+  attachments?: MailAttachment[];
 }
 
 export interface SendResult {

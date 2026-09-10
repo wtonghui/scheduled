@@ -50,6 +50,15 @@ export class SmtpMailService implements MailService {
           ...(req.externalRef ? { "X-Scheduled-Run-Id": req.externalRef } : {}),
           ...req.headers,
         },
+        ...(req.attachments && req.attachments.length > 0
+          ? {
+              attachments: req.attachments.map((a) => ({
+                filename: a.filename,
+                content: a.content,
+                contentType: a.contentType,
+              })),
+            }
+          : {}),
       });
       return { messageId: info.messageId ?? null, providerResponse: info.response, status: "sent" };
     } catch (error) {

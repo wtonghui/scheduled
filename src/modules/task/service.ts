@@ -41,6 +41,9 @@ type TaskRow = Prisma.TaskGetPayload<{
     payload: true;
     payloadSecrets: true;
     webhookUrl: true;
+    emailSubjectTemplate: true;
+    emailBodyTemplate: true;
+    emailAttachmentUrlTemplate: true;
     enabled: true;
     maxAttempts: true;
     timeoutMs: true;
@@ -78,6 +81,12 @@ export interface TaskView {
   recipients: string[];
   notifyOn: string[];
   webhookUrl: string | null;
+  /** 邮件标题模板（{xxx} 占位，运行时从响应体替换）；null=沿用默认标题 */
+  emailSubjectTemplate: string | null;
+  /** 邮件正文模板（HTML，{xxx} 占位）；null=沿用默认 React Email 模板 */
+  emailBodyTemplate: string | null;
+  /** 附件 URL 模板（{xxx} 占位）；null=无附件 */
+  emailAttachmentUrlTemplate: string | null;
   systemUserId?: string | null;
   nextRunAt: Date | null;
   version: number;
@@ -139,6 +148,9 @@ function toView(row: TaskRow): TaskView {
     recipients: row.recipients as string[],
     notifyOn: row.notifyOn as string[],
     webhookUrl: row.webhookUrl,
+    emailSubjectTemplate: row.emailSubjectTemplate,
+    emailBodyTemplate: row.emailBodyTemplate,
+    emailAttachmentUrlTemplate: row.emailAttachmentUrlTemplate,
     systemUserId: (row as any).systemUserId ?? null,
     nextRunAt: row.nextRunAt,
     version: row.version,
@@ -290,6 +302,9 @@ export async function create(
     recipients: data.recipients as Prisma.InputJsonValue,
     notifyOn: data.notifyOn as Prisma.InputJsonValue,
     webhookUrl: data.webhookUrl ?? null,
+    emailSubjectTemplate: data.emailSubjectTemplate ?? null,
+    emailBodyTemplate: data.emailBodyTemplate ?? null,
+    emailAttachmentUrlTemplate: data.emailAttachmentUrlTemplate ?? null,
     ...(data.systemUserId ? { systemUserId: data.systemUserId } : {}),
     webhookSecret: data.webhookUrl ? new Uint8Array(encryptSecret(generateWebhookSecret())) : null,
     nextRunAt,
@@ -452,6 +467,15 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
         webhookSecret: data.webhookUrl
           ? new Uint8Array(encryptSecret(generateWebhookSecret()))
           : null,
+      }),
+      ...(data.emailSubjectTemplate !== undefined && {
+        emailSubjectTemplate: data.emailSubjectTemplate,
+      }),
+      ...(data.emailBodyTemplate !== undefined && {
+        emailBodyTemplate: data.emailBodyTemplate,
+      }),
+      ...(data.emailAttachmentUrlTemplate !== undefined && {
+        emailAttachmentUrlTemplate: data.emailAttachmentUrlTemplate,
       }),
       ...(data.systemUserId !== undefined && {
         systemUserId: data.systemUserId || null,

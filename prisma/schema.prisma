@@ -64,6 +64,9 @@ model Task {
   notifyOn                Json            @default("[\"succeeded\",\"failed\"]") @map("notify_on")
   webhookUrl              String?         @map("webhook_url") @db.Text
   webhookSecret           Bytes?          @map("webhook_secret") // HMAC 密钥（加密存储）
+  emailSubjectTemplate    String?         @map("email_subject_template") @db.VarChar(255)
+  emailBodyTemplate       String?         @map("email_body_template") @db.Text
+  emailAttachmentUrlTemplate String?      @map("email_attachment_url_template") @db.VarChar(512)
   nextRunAt               DateTime?       @map("next_run_at") @db.DateTime(6)
   claimedBy               String?         @map("claimed_by") @db.VarChar(64)
   claimedUntil            DateTime?       @map("claimed_until") @db.DateTime(6)
@@ -129,6 +132,7 @@ model EmailLog {
   createdAt        DateTime      @default(now()) @map("created_at") @db.DateTime(6)
   updatedAt        DateTime      @updatedAt @map("updated_at") @db.DateTime(6)
   systemUserId    String?       @map("system_user_id") @db.VarChar(191) // 系统内用户标识
+  attachmentUrl   String?       @map("attachment_url") @db.VarChar(512) // 渲染好的附件下载 URL（来自模板引擎）
   execution        TaskExecution @relation(fields: [runId], references: [id])
   tenant           Tenant        @relation(fields: [tenantId], references: [id])
 

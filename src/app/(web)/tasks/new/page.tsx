@@ -42,6 +42,11 @@ export default function NewTaskPage() {
         : {}),
       ...(values.endsAt ? { endsAt: values.endsAt } : {}),
       ...(values.maxRuns ? { maxRuns: values.maxRuns } : {}),
+      ...(values.emailSubjectTemplate ? { emailSubjectTemplate: values.emailSubjectTemplate } : {}),
+      ...(values.emailBodyTemplate ? { emailBodyTemplate: values.emailBodyTemplate } : {}),
+      ...(values.emailAttachmentUrlTemplate
+        ? { emailAttachmentUrlTemplate: values.emailAttachmentUrlTemplate }
+        : {}),
       taskType: values.taskType,
       payload:
         values.taskType === "http"
