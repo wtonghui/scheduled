@@ -51,6 +51,9 @@ model Task {
   runAt                   DateTime?       @map("run_at") @db.DateTime(6) // 一次性时刻；与 cron/interval 三选一
   timezone                String          @default("Asia/Shanghai") @map("timezone") @db.VarChar(64) // cron 解析用 IANA 时区
   retryDelayMs            Int?            @map("retry_delay_ms") // 同次调度内重试等待基线（毫秒）；null=沿用默认退避
+  startsAt                DateTime?       @map("starts_at") @db.DateTime(6) // 重复调度的开始时刻；首跑从此起算
+  skipHolidays            Boolean         @default(false) @map("skip_holidays") // 到点遇假日是否跳过/顺延
+  holidayPolicy           String          @default("drop") @map("holiday_policy") @db.VarChar(16) // drop 作废 / postpone 顺延到下一工作日同墙钟时刻
   overlapPolicy           String          @default("skip") @map("overlap_policy") @db.VarChar(16) // 上次未结束时：skip 跳过 / queue 排队 / run 允许并行
   endsAt                  DateTime?       @map("ends_at") @db.DateTime(6) // 重复调度的截止时刻；与 maxRuns 可共存（谁先到谁停）
   maxRuns                 Int?            @map("max_runs") // 重复调度的总次数上限（调度触发计，run-now/重试/跳过不计）
@@ -180,6 +183,7 @@ model WebhookDelivery {
   sentAt        DateTime?     @map("sent_at") @db.DateTime(6)
   systemUserId String?       @map("system_user_id") @db.VarChar(191) // 系统内用户标识
   createdAt     DateTime      @default(now()) @map("created_at") @db.DateTime(6)
+  updatedAt     DateTime      @updatedAt @map("updated_at") @db.DateTime(6)
   execution     TaskExecution @relation(fields: [runId], references: [id])
   tenant        Tenant        @relation(fields: [tenantId], references: [id])
 

@@ -101,6 +101,15 @@ export function jitteredDelayMs(
   return Math.random() * max;
 }
 
+/**
+ * 任务重试等待：基线可配，封顶取 30s 与基线较大者。
+ * 默认 base=1000 时恒为 30s 封顶（老行为不变）；自定义基线（如 300000）不再被 30s 钳住。
+ * attemptIndex 从 0 起（第 1 次失败后等待传 0）。
+ */
+export function computeRetryDelayMs(baseMs: number, attemptIndex: number): number {
+  return jitteredDelayMs(baseMs, 2, Math.max(30000, baseMs), attemptIndex);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

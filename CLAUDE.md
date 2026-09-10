@@ -69,7 +69,7 @@ npm run coverage
 
 ### 调度模型（`src/lib/cron.ts` + `worker/scheduler.ts`）
 
-- 调度方式三选一：`cron`（5/6/7 段，7 段为 Quartz 式 `秒 分 时 日 月 周 年`；按任务 `timezone` 列解析，默认 `Asia/Shanghai`）**或** `scheduleIntervalSeconds`（固定间隔，顺延语义）**或** `runAt`（一次性绝对时刻，跑完自动停用），DTO 层 `isValidScheduleTriple` 强制恰有一个非空；`retryDelayMs` 为同次调度内重试等待基线（null=默认 1s×2/30s 封顶退避）；`overlapPolicy`（skip/queue/run，默认 skip=今天行为）控制上次未结束时下次到点的行为；`endsAt`/`maxRuns` 为结束规则（可共存，谁先到谁停；仅重复调度，一次性任务禁配）。
+- 调度方式三选一：`cron`（5/6/7 段，7 段为 Quartz 式 `秒 分 时 日 月 周 年`；按任务 `timezone` 列解析，默认 `Asia/Shanghai`）**或** `scheduleIntervalSeconds`（固定间隔，顺延语义）**或** `runAt`（一次性绝对时刻，跑完自动停用），DTO 层 `isValidScheduleTriple` 强制恰有一个非空；`retryDelayMs` 为同次调度内重试等待基线（null=默认 1s 起；实际等待 0~min(封顶,基线×2ⁿ) 随机，封顶=max(30s,基线)）；`overlapPolicy`（skip/queue/run，默认 skip=今天行为）控制上次未结束时下次到点的行为；`endsAt`/`maxRuns` 为结束规则（可共存，谁先到谁停；仅重复调度，一次性任务禁配）；`startsAt` 为重复调度的开始时刻（首跑从此起算）；`skipHolidays`/`holidayPolicy`（drop/postpone）控制到点遇假日的行为（按任务时区墙钟日期调 `HOLIDAY_API_*` 内网接口，失败 fail-open 当工作日；run-now 不受影响）。
 - Worker 每轮单事务领取到期任务 → 写租约（`claimed_by` / `claimed_until`）→ 推进 `next_run_at`；`SELECT ... FOR UPDATE SKIP LOCKED`（**版本探测**：MySQL <8.0.1 / MariaDB <10.6 不支持时自动退化为「条件 UPDATE + 受影响行数」的可移植领取，多实例仍恰好一次）。
 - **执行与领取解耦**（`worker/runner.ts`）：`runLoop` 每轮只按并发池 `freeSlots` 领取数量、`runner.submit()` 入池立即返回——单条长任务/流式只占自己的并发槽，不阻塞其他任务领取执行；邮件/Webhook 中继走独立后台通道（`relayLoop`），不进领取关键路径。**关机**：SIGTERM 先排空，超 `SHUTDOWN_GRACE_MS` 对在途任务 abort（`shutdownController`）。
 - **租约续期 + 孤儿对账**：heartbeat（≈10s）对运行中任务续 `claimed_until`（只续 `claimed_by=自己` 的行，`renewTaskLeases`），长任务不丢租约→不被别实例重复领取；`reconcileOrphanExecutions` 把租约过期的 `running` 执行整定为 failed（**不重跑**，防双副作用）并清过期认领。

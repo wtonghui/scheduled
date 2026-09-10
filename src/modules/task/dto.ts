@@ -24,7 +24,7 @@ export const HttpPayloadSchema = z.object({
 });
 export type HttpPayload = z.infer<typeof HttpPayloadSchema>;
 
-export const NotifyOnSchema = z.enum(["succeeded", "failed"]);
+export const NotifyOnSchema = z.enum(["succeeded", "failed", "succeeded_with_results"]);
 
 /** 一次性时刻：ISO 8601（允许 `Z` 或 `+08:00` 偏移，绝对时刻），必须在未来。 */
 export const RunAtSchema = z
@@ -61,6 +61,18 @@ export const EndsAtSchema = z
 /** 总次数上限：≥1，仅重复调度可配（调度触发计，run-now/重试/跳过不计）。 */
 export const MaxRunsSchema = z.number().int().min(1).max(1_000_000);
 
+/** 开始时刻：ISO 8601（允许偏移），必须在未来；仅 cron/interval 可配（重复任务未来才开跑）。 */
+export const StartsAtSchema = z
+  .string()
+  .trim()
+  .datetime({ offset: true, message: "startsAt must be an ISO 8601 datetime" })
+  .refine((v) => new Date(v).getTime() > Date.now(), {
+    message: "startsAt must be in the future",
+  });
+
+/** 节假日策略：drop 作废 / postpone 顺延到下一工作日同墙钟时刻；仅 skipHolidays=true 时有效。 */
+export const HolidayPolicySchema = z.enum(["drop", "postpone"]);
+
 /** 调度三选一：cron / 固定间隔 / 一次性时刻，恰好一个非空。 */
 export function isValidScheduleTriple(input: {
   cron?: string | null;
@@ -87,6 +99,9 @@ export const CreateTaskSchema = z
     overlapPolicy: OverlapPolicySchema.default("skip"),
     endsAt: EndsAtSchema.optional(),
     maxRuns: MaxRunsSchema.optional(),
+    startsAt: StartsAtSchema.optional(),
+    skipHolidays: z.boolean().default(false),
+    holidayPolicy: HolidayPolicySchema.default("drop"),
     taskType: TaskTypeSchema.default("http"),
     payload: z.unknown(),
     enabled: z.boolean().default(true),
@@ -119,6 +134,12 @@ export const CreateTaskSchema = z
   })
   .refine((d) => !(d.runAt && (d.endsAt || d.maxRuns || d.overlapPolicy !== "skip")), {
     message: "run-once tasks take no end rules or overlap policy (exactly one run)",
+  })
+  .refine((d) => !(d.runAt && (d.startsAt || d.skipHolidays || d.holidayPolicy !== "drop")), {
+    message: "run-once tasks take no startsAt or holiday rules (exactly one run)",
+  })
+  .refine((d) => d.holidayPolicy === "drop" || d.skipHolidays, {
+    message: "holidayPolicy requires skipHolidays=true",
   });
 
 export type CreateTaskInput = z.infer<typeof CreateTaskSchema>;
@@ -135,6 +156,9 @@ export const UpdateTaskSchema = z
     overlapPolicy: OverlapPolicySchema.optional(),
     endsAt: EndsAtSchema.nullable().optional(),
     maxRuns: MaxRunsSchema.nullable().optional(),
+    startsAt: StartsAtSchema.nullable().optional(),
+    skipHolidays: z.boolean().optional(),
+    holidayPolicy: HolidayPolicySchema.optional(),
     taskType: TaskTypeSchema.optional(),
     payload: z.unknown().optional(),
     enabled: z.boolean().optional(),
@@ -193,10 +217,30 @@ export const UpdateTaskSchema = z
       const hasEndsAt = "endsAt" in d && !!d.endsAt;
       const hasMaxRuns = "maxRuns" in d && !!d.maxRuns;
       const hasOverlap = "overlapPolicy" in d && !!d.overlapPolicy;
-      return !(hasEndsAt || hasMaxRuns || hasOverlap);
+      const hasStartsAt = "startsAt" in d && !!d.startsAt;
+      const hasHolidays =
+        ("skipHolidays" in d && !!d.skipHolidays) || ("holidayPolicy" in d && !!d.holidayPolicy);
+      return !(hasEndsAt || hasMaxRuns || hasOverlap || hasStartsAt || hasHolidays);
     },
     {
-      message: "run-once tasks take no end rules or overlap policy (exactly one run)",
+      message: "run-once tasks take no end rules, startsAt, holiday rules or overlap policy",
+    },
+  )
+  .refine(
+    (d) => {
+      // holidayPolicy 显式传了但没开 skipHolidays → 拒绝；单独出现由 service 按既有值校验
+      const hasPolicy = "holidayPolicy" in d && !!d.holidayPolicy;
+      if (!hasPolicy) {
+        return true;
+      }
+      const wantsSkip = "skipHolidays" in d ? !!d.skipHolidays : null;
+      if (wantsSkip === null) {
+        return true;
+      }
+      return wantsSkip;
+    },
+    {
+      message: "holidayPolicy requires skipHolidays=true",
     },
   );
 

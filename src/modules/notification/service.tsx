@@ -53,6 +53,38 @@ function emailSubject(taskName: string, status: string): string {
 }
 
 /**
+ * "有结果"判定：执行器返回了业务数据（HTTP 响应体非空）。
+ * noop 的 {kind} 无 data → false；HTTP 2xx 空 body → data 为 ""（空串非 null，算有结果）。
+ * 注意：与邮件模板上下文无关，门控只看"有没有业务数据"。
+ */
+export function hasNotificationResults(result: unknown): boolean {
+  if (!result || typeof result !== "object") {
+    return false;
+  }
+  return (result as Record<string, unknown>).data != null;
+}
+
+/**
+ * 通知门控（邮件与 Webhook 同闸）：
+ * failed（含 timeout/dead，上游已归一）→ 含 failed 即通知；
+ * succeeded → 含 succeeded 即通知，否则含 succeeded_with_results 且有业务数据才通知。
+ * succeeded 与 succeeded_with_results 共存时前者为准（超集）。
+ */
+export function shouldNotifyForStatus(
+  notifyOn: string[],
+  statusKey: "succeeded" | "failed",
+  result?: unknown,
+): boolean {
+  if (statusKey === "failed") {
+    return notifyOn.includes("failed");
+  }
+  if (notifyOn.includes("succeeded")) {
+    return true;
+  }
+  return notifyOn.includes("succeeded_with_results") && hasNotificationResults(result);
+}
+
+/**
  * 从执行器返回值中提取模板上下文。
  * HTTP 执行器返回 { status, redirects, attempt, data }，其中 data 是响应体 {code, msg, data}。
  * 直接用响应体里内层 data 对象的字段做上下文（{rowCount}、{fileUrl}）：
@@ -60,8 +92,7 @@ function emailSubject(taskName: string, status: string): string {
  * 否则 → 空上下文（占位符保留原文 + warn）。
  */
 function buildTemplateContext(summary: RunSummary): Record<string, unknown> {
-  const inner = (summary.result as { data?: { data?: unknown } } | null | undefined)?.data
-    ?.data;
+  const inner = (summary.result as { data?: { data?: unknown } } | null | undefined)?.data?.data;
   if (inner && typeof inner === "object" && !Array.isArray(inner)) {
     return inner as Record<string, unknown>;
   }
@@ -141,11 +172,10 @@ export async function enqueueNotificationsFromRun(
   try {
     const statusKey = summary.status === "succeeded" ? "succeeded" : "failed";
     const shouldEmail =
-      ctx.recipients.length > 0 &&
-      (ctx.notifyOn.includes("succeeded") || ctx.notifyOn.includes("failed")) &&
-      ctx.notifyOn.includes(statusKey);
+      ctx.recipients.length > 0 && shouldNotifyForStatus(ctx.notifyOn, statusKey, summary.result);
     // webhook 与邮件同受 notifyOn 约束（timeout/dead 按 failed 归类）
-    const shouldWebhook = !!ctx.webhookUrl && ctx.notifyOn.includes(statusKey);
+    const shouldWebhook =
+      !!ctx.webhookUrl && shouldNotifyForStatus(ctx.notifyOn, statusKey, summary.result);
 
     if (!shouldEmail && !shouldWebhook) {
       return;

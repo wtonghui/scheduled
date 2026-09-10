@@ -2,6 +2,7 @@ import { DEFAULT_TIMEZONE, computeNextRun } from "@/lib/cron";
 import { decryptJson, encryptJson, encryptSecret, generateWebhookSecret } from "@/lib/crypto";
 import { prisma } from "@/lib/db";
 import { AppError } from "@/lib/errors";
+import { adjustForHolidays, isHolidayConfigured, type HolidayPolicy } from "@/lib/holiday";
 import { checkUrlForSsrf } from "@/lib/ssrf";
 import type { Prisma } from "@prisma/client";
 import {
@@ -37,6 +38,9 @@ type TaskRow = Prisma.TaskGetPayload<{
     overlapPolicy: true;
     endsAt: true;
     maxRuns: true;
+    startsAt: true;
+    skipHolidays: true;
+    holidayPolicy: true;
     taskType: true;
     payload: true;
     payloadSecrets: true;
@@ -73,6 +77,12 @@ export interface TaskView {
   endsAt: Date | null;
   /** 重复调度总次数上限（调度触发计，run-now/重试/跳过不计） */
   maxRuns: number | null;
+  /** 重复调度的开始时刻；首跑从此起算，之后自然失效 */
+  startsAt: Date | null;
+  /** 到点遇假日是否跳过/顺延 */
+  skipHolidays: boolean;
+  /** drop 作废 / postpone 顺延到下一工作日同墙钟时刻 */
+  holidayPolicy: string;
   taskType: "http" | "noop";
   payload: Record<string, unknown>;
   enabled: boolean;
@@ -98,6 +108,48 @@ export interface TaskView {
    * 仅作 UI 显隐用，写操作仍由 requireAuth + 租户隔离后端强制。
    */
   writable: boolean;
+}
+
+/**
+ * 首跑时刻：startsAt 之前不触发。
+ * cron → 从 max(now, startsAt) 起算第一个命中点；
+ * interval → startsAt 在未来则首跑即 startsAt，否则 now+N（顺延）。
+ */
+function resolveFirstRun(
+  schedule: { cron?: string | null; scheduleIntervalSeconds?: number | null },
+  startsAt: Date | null,
+  timezone: string,
+  now: Date,
+): Date | null {
+  const ref = startsAt && startsAt.getTime() > now.getTime() ? startsAt : now;
+  if (typeof schedule.scheduleIntervalSeconds === "number") {
+    if (startsAt && startsAt.getTime() > now.getTime()) {
+      return startsAt;
+    }
+    return new Date(now.getTime() + schedule.scheduleIntervalSeconds * 1000);
+  }
+  return computeNextRun(schedule, ref, timezone);
+}
+
+/** 假日调整（skipHolidays=false 直接返回原值，零开销）。 */
+async function applyHolidayPolicy(
+  next: Date | null,
+  opts: {
+    skipHolidays: boolean;
+    holidayPolicy: string;
+    timezone: string;
+    schedule: { cron?: string | null; scheduleIntervalSeconds?: number | null };
+  },
+): Promise<Date | null> {
+  if (!next || !opts.skipHolidays) {
+    return next;
+  }
+  return adjustForHolidays({
+    candidate: next,
+    policy: opts.holidayPolicy as HolidayPolicy,
+    timezone: opts.timezone,
+    nextAfter: (d) => computeNextRun(opts.schedule, d, opts.timezone),
+  });
 }
 
 function splitPayload(
@@ -140,6 +192,9 @@ function toView(row: TaskRow): TaskView {
     overlapPolicy: row.overlapPolicy,
     endsAt: row.endsAt,
     maxRuns: row.maxRuns,
+    startsAt: row.startsAt,
+    skipHolidays: row.skipHolidays,
+    holidayPolicy: row.holidayPolicy,
     taskType: row.taskType,
     payload,
     enabled: row.enabled,
@@ -269,18 +324,28 @@ export async function create(
 
   const { publicPayload, secretBytes } = splitPayload(data.taskType, httpPayload);
   const timezone = data.timezone ?? DEFAULT_TIMEZONE;
-  const nextRunAt = data.runAt
+  const startsAt = data.startsAt ? new Date(data.startsAt) : null;
+  const schedule = { cron: data.cron, scheduleIntervalSeconds: data.scheduleIntervalSeconds };
+  let nextRunAt = data.runAt
     ? new Date(data.runAt)
-    : computeNextRun(
-        { cron: data.cron, scheduleIntervalSeconds: data.scheduleIntervalSeconds },
-        new Date(),
-        timezone,
-      );
+    : resolveFirstRun(schedule, startsAt, timezone, new Date());
   if (!nextRunAt) {
     throw new AppError(400, "VALIDATION", "schedule yields no future run");
   }
   if (data.endsAt && new Date(data.endsAt).getTime() <= nextRunAt.getTime()) {
     throw new AppError(400, "VALIDATION", "endsAt is before the first scheduled run");
+  }
+  if (data.skipHolidays && !isHolidayConfigured()) {
+    throw new AppError(400, "VALIDATION", "holiday API not configured (HOLIDAY_API_URL/APP_KEY)");
+  }
+  nextRunAt = await applyHolidayPolicy(nextRunAt, {
+    skipHolidays: data.skipHolidays,
+    holidayPolicy: data.holidayPolicy,
+    timezone,
+    schedule,
+  });
+  if (!nextRunAt) {
+    throw new AppError(400, "VALIDATION", "schedule yields no future run");
   }
 
   const row = await repoCreate(tenantId, ownerTokenId, {
@@ -293,6 +358,9 @@ export async function create(
     overlapPolicy: data.overlapPolicy,
     endsAt: data.endsAt ? new Date(data.endsAt) : null,
     maxRuns: data.maxRuns ?? null,
+    startsAt: data.startsAt ? new Date(data.startsAt) : null,
+    skipHolidays: data.skipHolidays,
+    holidayPolicy: data.holidayPolicy,
     taskType: data.taskType,
     payload: publicPayload,
     payloadSecrets: secretBytes ? new Uint8Array(secretBytes) : null,
@@ -355,7 +423,14 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
   const scheduleTouched = "cron" in data || "scheduleIntervalSeconds" in data || "runAt" in data;
   // 生效时区：仅 cron 调度有意义；切到 interval/runAt 时归位默认，避免过期值误导
   let timezoneToStore: string | undefined;
-  if (scheduleTouched || "timezone" in data) {
+  const policyTouched =
+    scheduleTouched ||
+    "timezone" in data ||
+    "startsAt" in data ||
+    "skipHolidays" in data ||
+    "holidayPolicy" in data ||
+    "endsAt" in data;
+  if (policyTouched) {
     const effCron = data.cron !== undefined ? data.cron : existing.cron;
     const effInterval =
       data.scheduleIntervalSeconds !== undefined
@@ -383,45 +458,77 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
         "timezone is only meaningful with cron or runAt (fixed intervals carry no wall-clock)",
       );
     }
-    // 结束规则/重叠策略仅重复调度可配；单独出现时按既有调度校验（一次任务 → 400）
-    const endRuleTouched = "endsAt" in data || "maxRuns" in data || "overlapPolicy" in data;
+    // 结束规则/重叠策略/开始时刻/节假日仅重复调度可配；单独出现时按既有调度校验（一次任务 → 400）
+    const endRuleTouched =
+      "endsAt" in data ||
+      "maxRuns" in data ||
+      "overlapPolicy" in data ||
+      "startsAt" in data ||
+      "skipHolidays" in data ||
+      "holidayPolicy" in data;
     if (endRuleTouched && effKind === "runAt") {
       throw new AppError(
         400,
         "VALIDATION",
-        "run-once tasks take no end rules or overlap policy (exactly one run)",
+        "run-once tasks take no end rules, startsAt, holiday rules or overlap policy",
       );
+    }
+    const effSkipHolidays =
+      data.skipHolidays !== undefined ? data.skipHolidays : existing.skipHolidays;
+    if (effSkipHolidays && !isHolidayConfigured()) {
+      throw new AppError(400, "VALIDATION", "holiday API not configured (HOLIDAY_API_URL/APP_KEY)");
     }
     const effTimezone =
       data.timezone !== undefined ? (data.timezone ?? DEFAULT_TIMEZONE) : existing.timezone;
     timezoneToStore = effKind === "cron" || effKind === "runAt" ? effTimezone : DEFAULT_TIMEZONE;
+    const effStartsAt =
+      data.startsAt !== undefined
+        ? data.startsAt
+          ? new Date(data.startsAt)
+          : null
+        : existing.startsAt;
+    const effSchedule = {
+      cron: (effCron ?? undefined) as string | undefined,
+      scheduleIntervalSeconds: (effInterval ?? undefined) as number | undefined,
+    };
+    const effPolicy =
+      data.holidayPolicy !== undefined ? data.holidayPolicy : existing.holidayPolicy;
     nextRunAt = effRunAt
       ? effRunAt
-      : computeNextRun(
+      : await applyHolidayPolicy(
+          resolveFirstRun(effSchedule, effStartsAt, effTimezone, new Date()),
           {
-            cron: (effCron ?? undefined) as string | undefined,
-            scheduleIntervalSeconds: (effInterval ?? undefined) as number | undefined,
+            skipHolidays: effSkipHolidays,
+            holidayPolicy: effPolicy,
+            timezone: effTimezone,
+            schedule: effSchedule,
           },
-          new Date(),
-          effTimezone,
         );
+    const effEndsAt =
+      data.endsAt !== undefined ? (data.endsAt ? new Date(data.endsAt) : null) : existing.endsAt;
+    if (effEndsAt && nextRunAt && effEndsAt.getTime() <= nextRunAt.getTime()) {
+      throw new AppError(400, "VALIDATION", "endsAt is before the first scheduled run");
+    }
   }
   if (data.enabled === false) {
     nextRunAt = null;
   } else if (data.enabled === true && existing.enabled === false) {
     // 重启用：按既有调度（含一次性时刻与时区）重算；已过的一次性时刻由 worker 到期即领
-    nextRunAt = existing.runAt
+    const reSchedule = {
+      cron: (existing.cron ?? undefined) as string | undefined,
+      scheduleIntervalSeconds: (existing.scheduleIntervalSeconds ?? undefined) as
+        | number
+        | undefined,
+    };
+    const reFirst = existing.runAt
       ? existing.runAt
-      : computeNextRun(
-          {
-            cron: (existing.cron ?? undefined) as string | undefined,
-            scheduleIntervalSeconds: (existing.scheduleIntervalSeconds ?? undefined) as
-              | number
-              | undefined,
-          },
-          new Date(),
-          existing.timezone,
-        );
+      : resolveFirstRun(reSchedule, existing.startsAt, existing.timezone, new Date());
+    nextRunAt = await applyHolidayPolicy(reFirst, {
+      skipHolidays: existing.skipHolidays,
+      holidayPolicy: existing.holidayPolicy,
+      timezone: existing.timezone,
+      schedule: reSchedule,
+    });
   }
 
   const row = await updateTaskWithVersion(
@@ -450,6 +557,11 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
         endsAt: data.endsAt ? new Date(data.endsAt) : null,
       }),
       ...(data.maxRuns !== undefined && { maxRuns: data.maxRuns }),
+      ...(data.startsAt !== undefined && {
+        startsAt: data.startsAt ? new Date(data.startsAt) : null,
+      }),
+      ...(data.skipHolidays !== undefined && { skipHolidays: data.skipHolidays }),
+      ...(data.holidayPolicy !== undefined && { holidayPolicy: data.holidayPolicy }),
       ...(data.taskType !== undefined && { taskType: data.taskType }),
       ...(payloadUpdate !== undefined && { payload: payloadUpdate }),
       ...(secretsUpdate !== undefined && {

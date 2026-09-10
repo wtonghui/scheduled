@@ -141,13 +141,16 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `runAt` | string \| null | 一次性时刻（北京时间 ISO）；三选一，跑完自动停用 |
 | `timezone` | string | cron/runAt 解析用 IANA 时区（默认 `Asia/Shanghai`） |
 | `retryDelayMs` | number \| null | 重试等待基线（毫秒），null=默认退避 |
+| `startsAt` | string \| null | 开始时刻（北京时间 ISO）；首跑从此起算 |
+| `skipHolidays` | boolean | 到点遇假日是否跳过/顺延 |
+| `holidayPolicy` | string | `drop` 作废 / `postpone` 顺延 |
 | `taskType` | `http` \| `noop` | 执行器类型 |
 | `payload` | object | 执行负载；`http` 型字段见下，`noop` 型为 `{}` |
 | `enabled` | boolean | 是否启用；`false` 时不再调度 |
 | `maxAttempts` | number | 同次调度内最多尝试次数（1–10，超时 / 失败会重试） |
 | `timeoutMs` | number | 单次执行超时（毫秒） |
 | `recipients` | string[] | 终态邮件收件人 |
-| `notifyOn` | string[] | 触发通知的终态：`succeeded` / `failed`（邮件与 Webhook 同口径） |
+| `notifyOn` | string[] | 触发通知的终态：`succeeded` / `failed` / `succeeded_with_results`（成功且有业务数据才通知；邮件与 Webhook 同口径） |
 | `webhookUrl` | string \| null | 终态 Webhook 回调地址；未配置为 `null` |
 | `nextRunAt` | string \| null | 下次触发时间；停用任务为 `null` |
 | `version` | number | 乐观并发版本号；`PATCH` 必须带当前值，冲突返回 `409` |
@@ -439,7 +442,10 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `scheduleIntervalSeconds` | int | 三选一 | 固定间隔，≥1 秒；顺延语义（不对齐整点），与时区无关 |
 | `runAt` | string | 三选一 | 一次性时刻（ISO 8601，如 `2027-01-01T09:00:00+08:00`，须未来时间）；到点跑一次后自动停用 |
 | `timezone` | string | 否 | cron/runAt 解析用 IANA 时区，默认 `Asia/Shanghai`；仅 cron/runAt 有效（固定间隔为顺延语义，带它直接 400） |
-| `retryDelayMs` | int | 否 | 同次调度内重试等待基线 0–3_600_000ms；空=默认退避（1s 起×2/30s 封顶） |
+| `retryDelayMs` | int | 否 | 同次调度内重试等待基线 0–3_600_000ms；空=默认退避（1s 起×2/30s 封顶）。实际等待 = 0 ~ min(封顶, 基线×2ⁿ) 随机，封顶 = max(30s, 基线) |
+| `startsAt` | string | 否 | 重复调度的开始时刻（ISO 8601，须未来）；首跑从此起算，与 `runAt` 互斥 |
+| `skipHolidays` | boolean | 否 | 到点遇假日是否跳过/顺延，默认 `false`；仅 cron/interval；需服务端配好节假日 API |
+| `holidayPolicy` | string | 否 | `drop` 作废（默认）/ `postpone` 顺延到下一工作日同墙钟时刻 |
 | `overlapPolicy` | string | 否 | 上次未结束时：`skip` 跳过（默认）/ `queue` 排队 / `run` 允许并行；仅重复调度 |
 | `endsAt` | string | 否 | 重复调度截止时刻（ISO 8601，须未来）；与 `maxRuns` 可共存（谁先到谁停） |
 | `maxRuns` | int | 否 | 重复调度总次数上限（≥1）；调度触发计，run-now/重试/跳过不计 |
@@ -449,7 +455,7 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `maxAttempts` | int | 否 | 同次调度内重试上限 1–10，默认 `3` |
 | `timeoutMs` | int | 否 | 单次执行超时 1000–3_600_000ms，默认 `30000` |
 | `recipients` | string[] | 是 | 终态邮件收件人，≥1 个合法邮箱 |
-| `notifyOn` | string[] | 否 | 触发「邮件 + Webhook」的终态：`succeeded` / `failed`；默认 `["succeeded","failed"]`，只报失败填 `["failed"]` |
+| `notifyOn` | string[] | 否 | 触发「邮件 + Webhook」的终态：`succeeded` / `failed` / `succeeded_with_results`（成功且上游返回业务数据才通知，与 `succeeded` 共存时以前者为准）；默认 `["succeeded","failed"]`，只报失败填 `["failed"]` |
 | `webhookUrl` | string | 否 | 终态回调地址；出站签名密钥由平台内部生成（不回传） |
 | `systemUserId` | string | 否 | 系统内用户标识（可选，≤191 字符）；创建时可通过请求头 `X-System-User-Id` 或请求体传入，头值优先覆盖体值，写入任务表 `system_user_id` |
 
@@ -775,7 +781,9 @@ curl "http://localhost:3000/api/v1/email-log?page=1&pageSize=20&system_user_id=e
 - **cron**：5 段 `分 时 日 月 周`、6 段（首位为秒）或 7 段（Quartz 式 `秒 分 时 日 月 周 年`，如 `0 0 9 1 1 * 2027` 指定 2027 年执行；年份过后无未来运行，任务自动停用），按 `timezone` 解析。
 - **一次性**：`runAt` 为 ISO 8601 绝对时刻（须未来时间），到点跑一次后自动停用；与 `cron`/间隔三选一；一次性任务不可配 `overlapPolicy` / `endsAt` / `maxRuns`（只跑一次，无需结束规则）。
 - **时区**：`timezone` 为 IANA 名（默认 `Asia/Shanghai`），影响 cron 解析和 runAt 的墙钟上下文；固定间隔为顺延语义无钟表概念，带 `timezone` 直接 `400`。
-- **重试等待**：`retryDelayMs` 为同次调度内 attempt 间隔基线（抖动退避×2/30s 封顶保持不变），空=沿用默认。
+- **重试等待**：`retryDelayMs` 为同次调度内 attempt 间隔基线（抖动退避×2，封顶取 30s 与基线较大者），空=沿用默认。注意：`maxAttempts` 是总尝试次数（含初试，如填 4 = 初试 + 重试 3 次）；最坏单轮耗时 ≈ `maxAttempts × (timeoutMs + 退避)`，长等待在部署重启时可能被优雅关机宽限（`SHUTDOWN_GRACE_MS`）中断。
+- **开始时间**：`startsAt` 为 ISO 8601 绝对时刻（须未来，仅 cron/interval）；首跑从此起算（cron 取之后首个命中点，interval 首跑即该时刻），之后自然失效；与 `runAt` 互斥。
+- **节假日**：`skipHolidays=true` 时到点先查日历（按任务时区墙钟日期调节假日 API）。`drop`（默认）当次作废取之后首个非假日点；`postpone` 挪到下一工作日同墙钟时刻（撞车合并，不跑两遍）。API 不可达/超时/解析失败按工作日处理（fail-open）+ warn；run-now 手动触发不受影响。
 - **重叠策略**（`overlapPolicy`，仅重复调度）：上次执行未结束又到下次时刻时——`skip`（默认）跳过本次并写 `skipped` 审计行；`queue` 排队等上次跑完（落 `pending` 行，租约释放后被领取）；`run` 允许并行（用户自担双跑风险）。
 - **结束规则**（`endsAt` / `maxRuns`，仅重复调度，可共存，谁先到谁停）：`endsAt` 为截止时刻（ISO 8601，须未来），下次运行超出即停用；`maxRuns` 为总次数上限（≥1，调度触发计，run-now/重试/跳过不计），跑满即停用。
 - **时间基准**：调度与存储按 UTC 自洽（数据库连接强制 `timezone=Z`）；REST 返回的时间字段一律为带 `+08:00` 偏移的 ISO 8601（北京时间），如 `2026-08-25T10:00:00.000+08:00`，前端 `new Date()` 可直接无损解析。

@@ -251,7 +251,7 @@ describe("end rules + overlap policy (integration)", () => {
     expect(row?.nextRunAt).toBeNull();
   });
 
-  it("endsAt passed → disabled without running", async () => {
+  it("endsAt at tick boundary → tick still executes (inclusive), then disables", async () => {
     const created = await taskService.create(tenantId, ownerTokenId, {
       name: "expired",
       cron: "* * * * *",
@@ -260,10 +260,53 @@ describe("end rules + overlap policy (integration)", () => {
       payload: {},
       recipients: ["ops@example.com"],
     });
-    // 绕过 DTO（已过截止）：直接改行模拟过期
+    // tick 与 endsAt 同时刻（边界，含端）→ 本轮执行再停用
+    const at = new Date(Date.now() - 1_000);
     await prisma.task.update({
       where: { id: created.id },
-      data: { endsAt: new Date(Date.now() - 1_000), nextRunAt: new Date(Date.now() - 1_000) },
+      data: { endsAt: at, nextRunAt: at },
+    });
+    const items = await claimDueItems("sched-policy-worker", 30, 10);
+    expect(items.some((i) => i.task.id === created.id)).toBe(true);
+    const row = await prisma.task.findUnique({ where: { id: created.id } });
+    expect(row?.enabled).toBe(false);
+    expect(row?.nextRunAt).toBeNull();
+  });
+
+  it("endsAt: in-window tick still executes, then disables", async () => {
+    const created = await taskService.create(tenantId, ownerTokenId, {
+      name: "last-window",
+      cron: "* * * * *",
+      endsAt: new Date(Date.now() + 3_600_000).toISOString(),
+      taskType: "noop",
+      payload: {},
+      recipients: ["ops@example.com"],
+    });
+    // tick（60 秒前，已到期）在窗口内；重算的下次必超窗 → 本轮要执行再停用
+    await prisma.task.update({
+      where: { id: created.id },
+      data: { endsAt: new Date(Date.now() - 30_000), nextRunAt: new Date(Date.now() - 60_000) },
+    });
+    const items = await claimDueItems("sched-policy-worker", 30, 10);
+    expect(items.some((i) => i.task.id === created.id)).toBe(true);
+    const row = await prisma.task.findUnique({ where: { id: created.id } });
+    expect(row?.enabled).toBe(false);
+    expect(row?.nextRunAt).toBeNull();
+  });
+
+  it("endsAt: tick beyond window is dropped without running", async () => {
+    const created = await taskService.create(tenantId, ownerTokenId, {
+      name: "beyond-window",
+      cron: "* * * * *",
+      endsAt: new Date(Date.now() + 3_600_000).toISOString(),
+      taskType: "noop",
+      payload: {},
+      recipients: ["ops@example.com"],
+    });
+    // tick（60 秒前）本身已超窗（endsAt 90 秒前）→ 不执行直接停用
+    await prisma.task.update({
+      where: { id: created.id },
+      data: { endsAt: new Date(Date.now() - 90_000), nextRunAt: new Date(Date.now() - 60_000) },
     });
     const items = await claimDueItems("sched-policy-worker", 30, 10);
     expect(items.some((i) => i.task.id === created.id)).toBe(false);
@@ -321,5 +364,140 @@ describe("end rules + overlap policy (integration)", () => {
     await holdLease(created.id, "run");
     const items = await claimDueItems("sched-policy-worker", 30, 10);
     expect(items.some((i) => i.task.id === created.id)).toBe(true);
+  });
+});
+
+describe("startsAt + holidays (integration)", () => {
+  let tenantId: string;
+  let ownerTokenId: string;
+
+  beforeAll(async () => {
+    const t = await createTestTenant("sched-start-hol");
+    tenantId = t.id;
+    ownerTokenId = (await createTestToken(tenantId, ["tasks:read", "tasks:write"], "owner")).id;
+  });
+
+  afterAll(async () => {
+    await cleanupTenant(tenantId);
+  });
+
+  it("interval + future startsAt → nextRunAt == startsAt", async () => {
+    const startsAt = new Date(Date.now() + 3_600_000).toISOString();
+    const view = await taskService.create(tenantId, ownerTokenId, {
+      name: "interval-future",
+      scheduleIntervalSeconds: 60,
+      startsAt,
+      taskType: "noop",
+      payload: {},
+      recipients: ["ops@example.com"],
+    });
+    expect(view.startsAt?.toISOString()).toBe(new Date(startsAt).toISOString());
+    expect(view.nextRunAt?.toISOString()).toBe(new Date(startsAt).toISOString());
+  });
+
+  it("cron + future startsAt → first run at/after startsAt", async () => {
+    const startsAt = new Date(Date.now() + 3_600_000).toISOString();
+    const view = await taskService.create(tenantId, ownerTokenId, {
+      name: "cron-future",
+      cron: "* * * * *",
+      startsAt,
+      taskType: "noop",
+      payload: {},
+      recipients: ["ops@example.com"],
+    });
+    expect((view.nextRunAt as Date).getTime()).toBeGreaterThanOrEqual(new Date(startsAt).getTime());
+  });
+
+  it("startsAt + runAt → 400; past startsAt → 400", async () => {
+    await expect(
+      taskService.create(tenantId, ownerTokenId, {
+        name: "starts-once",
+        runAt: new Date(Date.now() + 3_600_000).toISOString(),
+        startsAt: new Date(Date.now() + 7_200_000).toISOString(),
+        taskType: "noop",
+        payload: {},
+        recipients: ["ops@example.com"],
+      }),
+    ).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+    await expect(
+      taskService.create(tenantId, ownerTokenId, {
+        name: "starts-past",
+        cron: "* * * * *",
+        startsAt: new Date(Date.now() - 1_000).toISOString(),
+        taskType: "noop",
+        payload: {},
+        recipients: ["ops@example.com"],
+      }),
+    ).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+  });
+
+  it("clearing startsAt resumes immediate scheduling", async () => {
+    const created = await taskService.create(tenantId, ownerTokenId, {
+      name: "starts-clear",
+      cron: "* * * * *",
+      startsAt: new Date(Date.now() + 3_600_000).toISOString(),
+      taskType: "noop",
+      payload: {},
+      recipients: ["ops@example.com"],
+    });
+    const updated = await taskService.update(tenantId, created.id, {
+      startsAt: null,
+      version: created.version,
+    });
+    expect(updated.startsAt).toBeNull();
+    expect((updated.nextRunAt as Date).getTime()).toBeLessThan(Date.now() + 3_600_000);
+  });
+
+  it("skipHolidays without api configured → 400", async () => {
+    await expect(
+      taskService.create(tenantId, ownerTokenId, {
+        name: "hol-noapi",
+        cron: "* * * * *",
+        skipHolidays: true,
+        taskType: "noop",
+        payload: {},
+        recipients: ["ops@example.com"],
+      }),
+    ).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+  });
+
+  it("skipHolidays + runAt → 400; policy-without-skip → 400", async () => {
+    await expect(
+      taskService.create(tenantId, ownerTokenId, {
+        name: "hol-once",
+        runAt: new Date(Date.now() + 3_600_000).toISOString(),
+        skipHolidays: true,
+        taskType: "noop",
+        payload: {},
+        recipients: ["ops@example.com"],
+      }),
+    ).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+    await expect(
+      taskService.create(tenantId, ownerTokenId, {
+        name: "hol-policy-only",
+        cron: "* * * * *",
+        holidayPolicy: "postpone",
+        taskType: "noop",
+        payload: {},
+        recipients: ["ops@example.com"],
+      }),
+    ).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+  });
+
+  it("stores skipHolidays=false + drop by default; update toggles", async () => {
+    const created = await taskService.create(tenantId, ownerTokenId, {
+      name: "hol-default",
+      cron: "* * * * *",
+      taskType: "noop",
+      payload: {},
+      recipients: ["ops@example.com"],
+    });
+    expect(created.skipHolidays).toBe(false);
+    expect(created.holidayPolicy).toBe("drop");
+    const updated = await taskService.update(tenantId, created.id, {
+      skipHolidays: false,
+      version: created.version,
+    });
+    expect(updated.skipHolidays).toBe(false);
   });
 });

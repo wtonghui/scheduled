@@ -47,14 +47,24 @@ async function downloadAttachment(url: string): Promise<MailAttachment | null> {
  * 邮件中继（US3 独立测试场景）：轮询 email_log(pending) → MailService.send → 状态机。
  * 幂等：run_id UNIQUE（enqueue 侧）+ in_progress 乐观认领（本侧）。
  * payload 已持久化 html/text，不依赖任务行。
+ * 认领后崩溃遗留的 in_progress（updatedAt 超过阈值）会被回收重投，避免静默丢失。
  */
+
+/** in_progress 回收阈值：认领后 10 分钟仍未终态视为认领者已死（中继节拍秒级，正常投递远快于此）。 */
+const STALE_IN_PROGRESS_MS = 10 * 60 * 1000;
 
 export async function runEmailRelayOnce(limit = 20): Promise<number> {
   const now = new Date();
+  const staleBefore = new Date(now.getTime() - STALE_IN_PROGRESS_MS);
   const rows = await prisma.emailLog.findMany({
     where: {
-      status: { in: ["pending"] },
-      OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+      OR: [
+        {
+          status: { in: ["pending"] },
+          OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+        },
+        { status: "in_progress", updatedAt: { lt: staleBefore } },
+      ],
     },
     orderBy: { id: "asc" },
     take: limit,
@@ -63,11 +73,17 @@ export async function runEmailRelayOnce(limit = 20): Promise<number> {
   let delivered = 0;
   for (const row of rows) {
     const claimed = await prisma.emailLog.updateMany({
-      where: { id: row.id, status: "pending" },
+      where: {
+        id: row.id,
+        OR: [{ status: "pending" }, { status: "in_progress", updatedAt: { lt: staleBefore } }],
+      },
       data: { status: "in_progress" },
     });
     if (claimed.count === 0) {
       continue;
+    }
+    if (row.status === "in_progress") {
+      logger.warn({ run_id: row.runId }, "reclaimed stale in_progress email, redelivering");
     }
 
     try {

@@ -183,4 +183,63 @@ describe("UpdateTaskSchema schedule fields", () => {
       }).success,
     ).toBe(true);
   });
+
+  it("accepts startsAt-only (future), rejects past and runAt combo", () => {
+    expect(
+      CreateTaskSchema.safeParse({
+        ...baseCreate,
+        cron: "* * * * *",
+        startsAt: "2099-01-01T00:00:00Z",
+      }).success,
+    ).toBe(true);
+    expect(
+      CreateTaskSchema.safeParse({
+        ...baseCreate,
+        cron: "* * * * *",
+        startsAt: "2000-01-01T00:00:00Z",
+      }).success,
+    ).toBe(false);
+    expect(
+      CreateTaskSchema.safeParse({
+        ...baseCreate,
+        runAt: "2099-01-01T09:00:00+08:00",
+        startsAt: "2099-06-01T00:00:00Z",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects holiday rules with runAt, policy-without-skip", () => {
+    expect(
+      CreateTaskSchema.safeParse({
+        ...baseCreate,
+        runAt: "2099-01-01T09:00:00+08:00",
+        skipHolidays: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      CreateTaskSchema.safeParse({
+        ...baseCreate,
+        cron: "* * * * *",
+        holidayPolicy: "postpone",
+      }).success,
+    ).toBe(false);
+    expect(
+      CreateTaskSchema.safeParse({
+        ...baseCreate,
+        cron: "* * * * *",
+        skipHolidays: true,
+        holidayPolicy: "postpone",
+      }).success,
+    ).toBe(true);
+  });
+
+  it("rejects runAt + startsAt in the same patch", () => {
+    expect(
+      UpdateTaskSchema.safeParse({
+        runAt: "2099-01-01T09:00:00+08:00",
+        startsAt: "2099-06-01T00:00:00Z",
+        version: 1,
+      }).success,
+    ).toBe(false);
+  });
 });

@@ -287,4 +287,105 @@ describe("notification outbox + relays", () => {
     const outcome = await runTaskWithScheduledAt(def, new Date(), "scheduled");
     expect(outcome.status).toBe("succeeded");
   });
+
+  it("succeeded_with_results: http with data notifies mail + webhook", async () => {
+    const task = await taskService.create(tenantId, ownerTokenId, {
+      name: "notify-results-http",
+      cron: "*/5 * * * *",
+      taskType: "http",
+      payload: { url: `${baseUrl}/ok`, method: "GET" },
+      recipients: ["ops@example.com"],
+      notifyOn: ["succeeded_with_results"],
+      webhookUrl: `${baseUrl}/hook`,
+    });
+    const def = await loadTaskDef(task.id);
+    const outcome = await runTaskWithScheduledAt(def, new Date(), "scheduled");
+    expect(outcome.status).toBe("succeeded");
+    // /ok 返回 {ok:true} → data 非空 → 邮件 + webhook 都入 outbox
+    const emails = await prisma.emailLog.findMany({ where: { taskId: task.id } });
+    expect(emails).toHaveLength(1);
+    const hooks = await prisma.webhookDelivery.findMany({ where: { runId: outcome.executionId } });
+    expect(hooks).toHaveLength(1);
+    // 中继只断言本行终态（全局计数会被文件内其他用例遗留行干扰）
+    await runWebhookRelayOnce(20);
+    await runEmailRelayOnce(20);
+    expect((await prisma.emailLog.findUnique({ where: { id: emails[0]!.id } }))?.status).toBe(
+      "sent",
+    );
+    expect((await prisma.webhookDelivery.findUnique({ where: { id: hooks[0]!.id } }))?.status).toBe(
+      "sent",
+    );
+  });
+
+  it("succeeded_with_results: noop without data notifies neither", async () => {
+    const created = await taskService.create(tenantId, ownerTokenId, {
+      name: "notify-results-noop",
+      cron: "*/5 * * * *",
+      taskType: "noop",
+      payload: {},
+      recipients: ["ops@example.com"],
+      notifyOn: ["succeeded_with_results"],
+      webhookUrl: `${baseUrl}/hook`,
+    });
+    const def = await loadTaskDef(created.id);
+    const outcome = await runTaskWithScheduledAt(def, new Date(), "scheduled");
+    expect(outcome.status).toBe("succeeded");
+    // noop 结果 {kind} 无 data → 邮件 webhook 都不入 outbox
+    expect(await prisma.emailLog.findMany({ where: { taskId: created.id } })).toHaveLength(0);
+    expect(
+      await prisma.webhookDelivery.findMany({ where: { runId: outcome.executionId } }),
+    ).toHaveLength(0);
+  });
+
+  it("stale in_progress relay rows are reclaimed and delivered", async () => {
+    const task = await taskService.create(tenantId, ownerTokenId, {
+      name: "notify-reclaim",
+      cron: "*/5 * * * *",
+      taskType: "http",
+      payload: { url: `${baseUrl}/ok`, method: "GET" },
+      recipients: ["ops@example.com"],
+      webhookUrl: `${baseUrl}/hook`,
+    });
+    const def = await loadTaskDef(task.id);
+    const outcome = await runTaskWithScheduledAt(def, new Date(), "scheduled");
+    expect(outcome.status).toBe("succeeded");
+    // 模拟认领后崩溃：in_progress + updatedAt 20 分钟前
+    const staleAt = new Date(Date.now() - 20 * 60 * 1000);
+    const email = await prisma.emailLog.findFirst({ where: { taskId: task.id } });
+    await prisma.emailLog.update({
+      where: { id: email!.id },
+      data: { status: "in_progress", updatedAt: staleAt },
+    });
+    const hook = await prisma.webhookDelivery.findFirst({ where: { runId: outcome.executionId } });
+    await prisma.webhookDelivery.update({
+      where: { id: hook!.id },
+      data: { status: "in_progress", updatedAt: staleAt },
+    });
+    // 回收重投（只断言本行终态，全局计数会被遗留行干扰）
+    await runEmailRelayOnce(20);
+    await runWebhookRelayOnce(20);
+    expect((await prisma.emailLog.findUnique({ where: { id: email!.id } }))?.status).toBe("sent");
+    expect((await prisma.webhookDelivery.findUnique({ where: { id: hook!.id } }))?.status).toBe(
+      "sent",
+    );
+  });
+
+  it("fresh in_progress relay rows are left alone", async () => {
+    const task = await taskService.create(tenantId, ownerTokenId, {
+      name: "notify-fresh",
+      cron: "*/5 * * * *",
+      taskType: "http",
+      payload: { url: `${baseUrl}/ok`, method: "GET" },
+      recipients: ["ops@example.com"],
+    });
+    const def = await loadTaskDef(task.id);
+    await runTaskWithScheduledAt(def, new Date(), "scheduled");
+    const email = await prisma.emailLog.findFirst({ where: { taskId: task.id } });
+    // 刚认领（updatedAt 现在）→ 不回收；只断言本行仍为 in_progress（全局计数会被遗留行干扰）
+    await prisma.emailLog.update({ where: { id: email!.id }, data: { status: "in_progress" } });
+    await runEmailRelayOnce(20);
+    expect((await prisma.emailLog.findUnique({ where: { id: email!.id } }))?.status).toBe(
+      "in_progress",
+    );
+  });
 });

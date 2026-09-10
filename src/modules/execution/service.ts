@@ -9,7 +9,7 @@ import {
   taskInFlight,
   taskRunsTotal,
 } from "@/lib/metrics";
-import { classifyError, jitteredDelayMs } from "@/lib/retry";
+import { classifyError, computeRetryDelayMs } from "@/lib/retry";
 import {
   type NotifyContext,
   type RunSummary,
@@ -32,7 +32,7 @@ export interface RunTaskDefinition {
   payloadSecrets: Uint8Array | null;
   timeoutMs: number;
   maxAttempts: number;
-  /** 同次调度内重试等待基线（毫秒）；缺省/null=默认退避（1s 起×2/30s 封顶，老任务行为不变） */
+  /** 同次调度内重试等待基线（毫秒）；缺省/null=默认退避（1s 起，实际 0~min(封顶,基线×2ⁿ)，封顶=max(30s,基线)） */
   retryDelayMs?: number | null;
   tenantId: string;
   taskName: string;
@@ -264,7 +264,10 @@ export async function runTaskWithScheduledAt(
       }
 
       if (attempt < task.maxAttempts) {
-        const delayMs = jitteredDelayMs(task.retryDelayMs ?? 1000, 2, 30000, attempt - 1);
+        // 封顶跟随基线：默认 base=1000 时 cap 仍 30000（老行为不变）；
+        // 自定义基线（如 300000）不再被 30s 钳住。抖动（uniform 随机）保留。
+        const retryBaseMs = task.retryDelayMs ?? 1000;
+        const delayMs = computeRetryDelayMs(retryBaseMs, attempt - 1);
         logger.info({ task_id: task.id, attempt, delayMs }, "task attempt failed, will retry");
         taskAttemptsTotal.inc({ status: terminal });
         await prisma.taskExecution.update({

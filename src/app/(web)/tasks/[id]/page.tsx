@@ -27,6 +27,9 @@ interface TaskDetail {
   overlapPolicy: string;
   endsAt: string | null;
   maxRuns: number | null;
+  startsAt: string | null;
+  skipHolidays: boolean;
+  holidayPolicy: string;
   taskType: "http" | "noop";
   payload: Record<string, unknown>;
   enabled: boolean;
@@ -181,6 +184,15 @@ export default function TaskDetailPage() {
     ["重叠策略", overlapLabel(task.overlapPolicy)],
     ["截止", task.endsAt ? new Date(task.endsAt).toLocaleString() : "持续到手动停"],
     ["总次数", task.maxRuns != null ? String(task.maxRuns) : "不限"],
+    ["开始时间", task.startsAt ? new Date(task.startsAt).toLocaleString() : "立即开始"],
+    [
+      "节假日",
+      task.skipHolidays
+        ? task.holidayPolicy === "postpone"
+          ? "跳过并顺延"
+          : "跳过作废"
+        : "不跳过",
+    ],
     ["超时", `${task.timeoutMs}ms`],
     ["收件人", task.recipients.join(", ") || "—"],
     ["回调", task.webhookUrl ? <code key="hook">{task.webhookUrl}</code> : "—"],

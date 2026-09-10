@@ -33,6 +33,9 @@ export interface TaskInitial {
   overlapPolicy: string;
   endsAt: string | null;
   maxRuns: number | null;
+  startsAt: string | null;
+  skipHolidays: boolean;
+  holidayPolicy: string;
   emailSubjectTemplate: string | null;
   emailBodyTemplate: string | null;
   emailAttachmentUrlTemplate: string | null;
@@ -60,6 +63,12 @@ export interface TaskFormValues {
   endsAt?: string;
   /** 总次数上限（仅重复调度） */
   maxRuns?: number;
+  /** 开始时刻（ISO，UTC；仅 cron/interval，首跑从此起算） */
+  startsAt?: string;
+  /** 到点遇假日是否跳过/顺延（仅 cron/interval） */
+  skipHolidays?: boolean;
+  /** drop 作废 / postpone 顺延到下一工作日同墙钟时刻 */
+  holidayPolicy?: string;
   /** 邮件标题模板；空=默认标题 */
   emailSubjectTemplate?: string;
   /** 邮件正文模板（HTML）；空=默认 React Email 模板 */
@@ -136,7 +145,11 @@ export default function TaskForm({
     webhookUrl: initial?.webhookUrl ?? "",
     systemUserId: (initial as any)?.systemUserId ?? "",
     recipients: (initial?.recipients ?? [DEFAULT_RECIPIENT]).join(","),
-    notifySucceeded: (initial?.notifyOn ?? ["succeeded", "failed"]).includes("succeeded"),
+    notifySuccessMode: (initial?.notifyOn ?? ["succeeded", "failed"]).includes("succeeded")
+      ? ("all" as const)
+      : (initial?.notifyOn ?? []).includes("succeeded_with_results")
+        ? ("results" as const)
+        : ("none" as const),
     notifyFailed: (initial?.notifyOn ?? ["succeeded", "failed"]).includes("failed"),
   }));
 
@@ -172,6 +185,12 @@ export default function TaskForm({
   const [maxRuns, setMaxRuns] = useState(() =>
     initial?.maxRuns != null ? String(initial.maxRuns) : "",
   );
+  /** 开始墙钟（datetime-local），按所选时区解析为绝对时刻。 */
+  const [startsAtLocal, setStartsAtLocal] = useState(() =>
+    initial?.startsAt ? toLocalInput(initial.startsAt, initial.timezone ?? DEFAULT_TIMEZONE) : "",
+  );
+  const [skipHolidays, setSkipHolidays] = useState(initial?.skipHolidays ?? false);
+  const [holidayPolicy, setHolidayPolicy] = useState(initial?.holidayPolicy ?? "drop");
   const [emailSubjectTemplate, setEmailSubjectTemplate] = useState(
     initial?.emailSubjectTemplate ?? "",
   );
@@ -242,6 +261,7 @@ export default function TaskForm({
     // 结束规则（仅重复调度）：截止时刻按所选时区解析；次数≥1
     let endsAtIso: string | undefined;
     let maxRunsNum: number | undefined;
+    let startsAtIso: string | undefined;
     if (scheduleKind !== "once") {
       if (endsAtLocal) {
         const dt = DateTime.fromFormat(endsAtLocal, "yyyy-MM-dd'T'HH:mm", { zone: timezone });
@@ -250,6 +270,18 @@ export default function TaskForm({
           return;
         }
         endsAtIso = dt.toUTC().toISO() ?? undefined;
+      }
+      if (startsAtLocal) {
+        const dt = DateTime.fromFormat(startsAtLocal, "yyyy-MM-dd'T'HH:mm", { zone: timezone });
+        if (!dt.isValid || dt.toMillis() <= Date.now()) {
+          setError("开始时间必须是未来时刻");
+          return;
+        }
+        startsAtIso = dt.toUTC().toISO() ?? undefined;
+      }
+      if (endsAtIso && startsAtIso && startsAtIso >= endsAtIso) {
+        setError("开始时间必须早于截止时间");
+        return;
       }
       if (maxRuns.trim()) {
         const n = Number(maxRuns);
@@ -271,6 +303,9 @@ export default function TaskForm({
       overlapPolicy: scheduleKind === "once" ? undefined : overlapPolicy,
       endsAt: endsAtIso,
       maxRuns: maxRunsNum,
+      startsAt: startsAtIso,
+      skipHolidays: scheduleKind === "once" ? undefined : skipHolidays || undefined,
+      holidayPolicy: scheduleKind === "once" || !skipHolidays ? undefined : holidayPolicy,
       emailSubjectTemplate: emailSubjectTemplate.trim() || undefined,
       emailBodyTemplate: emailBodyTemplate.trim() || undefined,
       emailAttachmentUrlTemplate: emailAttachmentUrlTemplate.trim() || undefined,
@@ -287,7 +322,11 @@ export default function TaskForm({
         .map((s) => s.trim())
         .filter(Boolean),
       notifyOn: [
-        ...(form.notifySucceeded ? ["succeeded" as const] : []),
+        ...(form.notifySuccessMode === "all"
+          ? ["succeeded" as const]
+          : form.notifySuccessMode === "results"
+            ? ["succeeded_with_results" as const]
+            : []),
         ...(form.notifyFailed ? ["failed" as const] : []),
       ],
     };
@@ -398,7 +437,7 @@ export default function TaskForm({
           )}
 
           <div className="mt-4 max-w-72">
-            <Label htmlFor="task-retry-delay">重试等待（秒，可空=默认退避）</Label>
+            <Label htmlFor="task-retry-delay">重试等待基线（秒，可空=默认退避）</Label>
             <Input
               id="task-retry-delay"
               type="number"
@@ -406,7 +445,7 @@ export default function TaskForm({
               max={3600}
               value={retryDelaySec}
               onChange={(e) => setRetryDelaySec(e.target.value)}
-              placeholder="默认 1 秒起退避"
+              placeholder="默认 1 秒起退避；实际 0~基线×2ⁿ 随机"
               className="mt-1.5"
             />
           </div>
@@ -449,6 +488,40 @@ export default function TaskForm({
                   className="mt-1.5"
                 />
               </div>
+              <div className="mt-4 max-w-72">
+                <Label htmlFor="task-starts-at">开始时间（可空=立即开始）</Label>
+                <Input
+                  id="task-starts-at"
+                  type="datetime-local"
+                  value={startsAtLocal}
+                  onChange={(e) => setStartsAtLocal(e.target.value)}
+                  className="mt-1.5"
+                />
+              </div>
+              <div className="mt-4 flex items-center gap-2">
+                <Switch
+                  id="task-skip-holidays"
+                  checked={skipHolidays}
+                  onCheckedChange={setSkipHolidays}
+                />
+                <Label htmlFor="task-skip-holidays" className="cursor-pointer text-[13px]">
+                  到点遇节假日跳过（按所选时区查日历）
+                </Label>
+              </div>
+              {skipHolidays && (
+                <div className="mt-4 max-w-72">
+                  <Label>节假日策略</Label>
+                  <Select
+                    value={holidayPolicy}
+                    onValueChange={setHolidayPolicy}
+                    className="mt-1.5"
+                    options={[
+                      { value: "drop", label: "作废（少跑一次）" },
+                      { value: "postpone", label: "顺延到下一工作日" },
+                    ]}
+                  />
+                </div>
+              )}
             </>
           )}
 
@@ -538,7 +611,7 @@ export default function TaskForm({
           </div>
           <div className="col-span-2 mt-4">
             <Label htmlFor="task-email-subject">
-              邮件标题模板（可空=默认标题。用 {`{字段名}`} 从响应 data 取值）
+              邮件标题模板（可空=默认标题。用 {"{字段名}"} 从响应 data 取值）
             </Label>
             <Input
               id="task-email-subject"
@@ -550,7 +623,7 @@ export default function TaskForm({
           </div>
           <div className="col-span-2 mt-4">
             <Label htmlFor="task-email-body">
-              邮件正文模板（可空=默认模板。HTML，用 {`{字段名}`} 取值）
+              邮件正文模板（可空=默认模板。HTML，用 {"{字段名}"} 取值）
             </Label>
             <Textarea
               id="task-email-body"
@@ -597,15 +670,21 @@ export default function TaskForm({
             />
           </div>
 
-          <div className="mt-4 flex items-center gap-2">
-            <Switch
-              id="notify-succeeded"
-              checked={form.notifySucceeded}
-              onCheckedChange={(c) => set("notifySucceeded", c)}
+          <div className="mt-4 max-w-72">
+            <Label>成功时通知</Label>
+            <Select
+              value={form.notifySuccessMode}
+              onValueChange={(v) => set("notifySuccessMode", v as typeof form.notifySuccessMode)}
+              className="mt-1.5"
+              options={[
+                { value: "none", label: "不通知" },
+                { value: "all", label: "成功即通知" },
+                { value: "results", label: "有业务数据才通知" },
+              ]}
             />
-            <Label htmlFor="notify-succeeded" className="cursor-pointer text-[13px]">
-              成功时通知
-            </Label>
+            <p className="mt-1 text-xs text-text-faint">
+              有业务数据 = 上游返回了响应体（HTTP 2xx 非空 body）
+            </p>
           </div>
           <div className="mt-4 flex items-center gap-2">
             <Switch

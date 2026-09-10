@@ -28,6 +28,9 @@ interface TaskDetail {
   overlapPolicy: string;
   endsAt: string | null;
   maxRuns: number | null;
+  startsAt: string | null;
+  skipHolidays: boolean;
+  holidayPolicy: string;
   emailSubjectTemplate: string | null;
   emailBodyTemplate: string | null;
   emailAttachmentUrlTemplate: string | null;
@@ -120,6 +123,9 @@ export default function EditTaskPage() {
       ...(values.overlapPolicy ? { overlapPolicy: values.overlapPolicy } : {}),
       endsAt: values.endsAt ?? null,
       maxRuns: values.maxRuns ?? null,
+      startsAt: values.startsAt ?? null,
+      skipHolidays: values.skipHolidays ?? false,
+      ...(values.holidayPolicy ? { holidayPolicy: values.holidayPolicy } : {}),
       emailSubjectTemplate: values.emailSubjectTemplate ?? null,
       emailBodyTemplate: values.emailBodyTemplate ?? null,
       emailAttachmentUrlTemplate: values.emailAttachmentUrlTemplate ?? null,
@@ -187,6 +193,9 @@ export default function EditTaskPage() {
           overlapPolicy: task.overlapPolicy,
           endsAt: task.endsAt,
           maxRuns: task.maxRuns,
+          startsAt: task.startsAt,
+          skipHolidays: task.skipHolidays,
+          holidayPolicy: task.holidayPolicy,
           emailSubjectTemplate: task.emailSubjectTemplate,
           emailBodyTemplate: task.emailBodyTemplate,
           emailAttachmentUrlTemplate: task.emailAttachmentUrlTemplate,

@@ -42,6 +42,11 @@ export default function NewTaskPage() {
         : {}),
       ...(values.endsAt ? { endsAt: values.endsAt } : {}),
       ...(values.maxRuns ? { maxRuns: values.maxRuns } : {}),
+      ...(values.startsAt ? { startsAt: values.startsAt } : {}),
+      ...(values.skipHolidays ? { skipHolidays: true } : {}),
+      ...(values.holidayPolicy && values.skipHolidays
+        ? { holidayPolicy: values.holidayPolicy }
+        : {}),
       ...(values.emailSubjectTemplate ? { emailSubjectTemplate: values.emailSubjectTemplate } : {}),
       ...(values.emailBodyTemplate ? { emailBodyTemplate: values.emailBodyTemplate } : {}),
       ...(values.emailAttachmentUrlTemplate

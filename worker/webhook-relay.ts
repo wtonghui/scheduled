@@ -10,14 +10,24 @@ import { signWebhook } from "../src/modules/webhook/signature";
  * Webhook 中继（FR-016 / contracts 投递契约）：
  * 轮询 webhook_delivery(pending) → POST payload + `X-Scheduled-Signature: t/v1`。
  * 2xx sent；429/5xx/超时重试；4xx 永久 failed；耗尽 dead。run_id 唯一幂等。
+ * 认领后崩溃遗留的 in_progress（updatedAt 超过阈值）会被回收重投，避免静默丢失。
  */
+
+/** in_progress 回收阈值：认领后 10 分钟仍未终态视为认领者已死（中继节拍秒级，正常投递远快于此）。 */
+const STALE_IN_PROGRESS_MS = 10 * 60 * 1000;
 
 export async function runWebhookRelayOnce(limit = 20): Promise<number> {
   const now = new Date();
+  const staleBefore = new Date(now.getTime() - STALE_IN_PROGRESS_MS);
   const rows = await prisma.webhookDelivery.findMany({
     where: {
-      status: { in: ["pending"] },
-      OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+      OR: [
+        {
+          status: { in: ["pending"] },
+          OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
+        },
+        { status: "in_progress", updatedAt: { lt: staleBefore } },
+      ],
     },
     orderBy: { id: "asc" },
     take: limit,
@@ -26,11 +36,17 @@ export async function runWebhookRelayOnce(limit = 20): Promise<number> {
   let delivered = 0;
   for (const row of rows) {
     const claimed = await prisma.webhookDelivery.updateMany({
-      where: { id: row.id, status: "pending" },
+      where: {
+        id: row.id,
+        OR: [{ status: "pending" }, { status: "in_progress", updatedAt: { lt: staleBefore } }],
+      },
       data: { status: "in_progress" },
     });
     if (claimed.count === 0) {
       continue;
+    }
+    if (row.status === "in_progress") {
+      logger.warn({ run_id: row.runId }, "reclaimed stale in_progress webhook, redelivering");
     }
 
     try {

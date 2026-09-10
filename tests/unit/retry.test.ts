@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { classifyError, jitteredDelayMs, retryWithJitter } from "../../src/lib/retry";
+import {
+  classifyError,
+  computeRetryDelayMs,
+  jitteredDelayMs,
+  retryWithJitter,
+} from "../../src/lib/retry";
 import { HttpError, TimeoutError } from "../../src/lib/errors";
 
 afterEach(() => {
@@ -55,6 +60,27 @@ describe("jitteredDelayMs", () => {
   });
 });
 
+describe("computeRetryDelayMs", () => {
+  it("keeps 30s cap for default base (legacy behavior)", () => {
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    expect(computeRetryDelayMs(1000, 0)).toBe(1000);
+    expect(computeRetryDelayMs(1000, 1)).toBe(2000);
+    expect(computeRetryDelayMs(1000, 10)).toBe(30000);
+  });
+
+  it("lets custom base through (no 30s clamp)", () => {
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    expect(computeRetryDelayMs(300000, 0)).toBe(300000);
+    expect(computeRetryDelayMs(300000, 1)).toBe(300000);
+    expect(computeRetryDelayMs(300000, 5)).toBe(300000);
+  });
+
+  it("base 0 means immediate retry", () => {
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    expect(computeRetryDelayMs(0, 0)).toBe(0);
+  });
+});
+
 describe("retryWithJitter", () => {
   it("returns success on the first attempt", async () => {
     const fn = vi.fn(async () => "ok");
@@ -97,11 +123,9 @@ describe("retryWithJitter", () => {
   it("reports onRetry with a computed delay", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0.5);
     const retries: Array<{ error: unknown; attempt: number; delayMs: number }> = [];
-    const fn = vi
-      .fn<(attempt: number) => Promise<unknown>>()
-      .mockImplementation(async () => {
-        throw Object.assign(new Error("transient"), { code: "ECONNRESET" });
-      });
+    const fn = vi.fn<(attempt: number) => Promise<unknown>>().mockImplementation(async () => {
+      throw Object.assign(new Error("transient"), { code: "ECONNRESET" });
+    });
     await retryWithJitter({
       attempts: 3,
       fn,

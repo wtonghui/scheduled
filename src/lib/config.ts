@@ -63,6 +63,18 @@ const EnvSchema = z.object({
     .optional()
     .transform((v) => v !== undefined && v.trim() !== "" && v.trim().toLowerCase() === "true"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
+
+  // 节假日 API（可选；不配则 skipHolidays 任务在创建/更新时 400）。
+  // URL 不含 appKey（key 单独配，避免进日志）；natural_day 按任务时区墙钟日期。
+  HOLIDAY_API_URL: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.string().url().optional(),
+  ),
+  HOLIDAY_API_APP_KEY: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined || v.trim() === "" ? undefined : v)),
+  HOLIDAY_API_TIMEOUT_MS: z.coerce.number().int().min(1000).max(30000).default(5000),
 });
 
 const parsed = EnvSchema.safeParse(process.env);

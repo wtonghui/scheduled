@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client";
 import { createPool } from "../src/lib/concurrency";
 import { computeNextRun } from "../src/lib/cron";
 import { prisma } from "../src/lib/db";
+import { adjustForHolidays, type HolidayPolicy } from "../src/lib/holiday";
 import { logger } from "../src/lib/logger";
 import type { RunTaskDefinition } from "../src/modules/execution/service";
 
@@ -28,6 +29,8 @@ interface DueRow {
   overlapPolicy: string;
   endsAt: Date | null;
   maxRuns: number | bigint | null;
+  skipHolidays: boolean;
+  holidayPolicy: string;
   taskType: string;
   timeoutMs: number | bigint;
   maxAttempts: number | bigint;
@@ -91,6 +94,7 @@ function toTaskDefinition(row: DueRow): RunTaskDefinition {
 const TASK_COLUMNS = Prisma.sql`
   id, cron, schedule_interval_seconds AS scheduleIntervalSeconds,
   timezone, overlap_policy AS overlapPolicy, ends_at AS endsAt, max_runs AS maxRuns,
+  skip_holidays AS skipHolidays, holiday_policy AS holidayPolicy,
   task_type AS taskType, timeout_ms AS timeoutMs, max_attempts AS maxAttempts,
   retry_delay_ms AS retryDelayMs,
   payload, payload_secrets AS payloadSecrets, next_run_at AS nextRunAt,
@@ -127,23 +131,27 @@ async function countScheduledRuns(
   return used;
 }
 
-/** 结束规则命中即停用：无下次 / 超过 endsAt / 跑满 maxRuns（三者谁先到谁停）。 */
-function endRuleExhausted(
+/** 假日调整（skipHolidays=false 直接返回原值，零开销；失败 fail-open 在 holiday 模块内）。 */
+async function applyTaskHolidays(
   next: Date | null,
-  endsAt: Date | null,
-  maxRuns: number | bigint | null,
-  used: number,
-): boolean {
-  if (!next) {
-    return true;
+  row: {
+    cron: string | null;
+    scheduleIntervalSeconds: number | null;
+    timezone: string;
+    skipHolidays: boolean;
+    holidayPolicy: string;
+  },
+): Promise<Date | null> {
+  if (!next || !row.skipHolidays) {
+    return next;
   }
-  if (endsAt && next.getTime() > endsAt.getTime()) {
-    return true;
-  }
-  if (maxRuns != null && used >= Number(maxRuns)) {
-    return true;
-  }
-  return false;
+  const schedule = { cron: row.cron, scheduleIntervalSeconds: row.scheduleIntervalSeconds };
+  return adjustForHolidays({
+    candidate: next,
+    policy: (row.holidayPolicy as HolidayPolicy) ?? "drop",
+    timezone: row.timezone,
+    nextAfter: (d) => computeNextRun(schedule, d, row.timezone),
+  });
 }
 
 /** 调度触发执行行补跑宽限期：created_at 距今超过该秒数才允许被别实例（补跑）领取，
@@ -242,31 +250,39 @@ export async function claimDueItems(
     );
 
     for (const row of due) {
-      const next = computeNextRun(
+      const rawNext = computeNextRun(
         { cron: row.cron, scheduleIntervalSeconds: row.scheduleIntervalSeconds },
         new Date(),
         row.timezone,
       );
-      // 结束规则命中 → 停用且不产生本次执行（配额用尽/过期不审计，与 overlap 跳过区分）。
-      // 注意 next==null 不在此列：到期的一次性任务（runAt）无下次但本轮欠一次，
-      // 走原领取路径执行一次并停用（既有语义）。
-      if (
-        (next && row.endsAt && next.getTime() > row.endsAt.getTime()) ||
-        (row.maxRuns != null && (usedMap.get(row.id) ?? 0) >= Number(row.maxRuns))
-      ) {
+      // 先假日调整再判结束规则（被顺延/跳过的 tick 不占配额，超 endsAt 才停）
+      const next = await applyTaskHolidays(rawNext, row);
+      const tick = new Date(row.nextRunAt);
+      // maxRuns 计已执行次数：用尽则本轮不跑（跑了就超配额）。
+      if (row.maxRuns != null && (usedMap.get(row.id) ?? 0) >= Number(row.maxRuns)) {
         await tx.$executeRaw(
           Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id}`,
         );
         continue;
       }
+      // endsAt 按本轮 tick 判定（tick 在窗口内就执行；重算的下次超窗只影响推进）。
+      // 注意 next==null 不拦执行：到期的一次性任务（runAt）无下次但本轮欠一次，
+      // 走原领取路径执行一次并停用（既有语义）。
+      if (row.endsAt && tick.getTime() > row.endsAt.getTime()) {
+        await tx.$executeRaw(
+          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id}`,
+        );
+        continue;
+      }
+      const advanceTo = next && row.endsAt && next.getTime() > row.endsAt.getTime() ? null : next;
       // 归属判定：SKIP LOCKED 下持有行锁必命中；兼容路径下若已被别实例抢先，affectedRows=0 → 跳过。
       const claimed = await tx.$executeRaw(
         Prisma.sql`
           UPDATE task
           SET claimed_by = ${workerId},
               claimed_until = DATE_ADD(NOW(), INTERVAL ${leaseSeconds} SECOND),
-              next_run_at = ${next},
-              enabled = ${next ? 1 : 0}
+              next_run_at = ${advanceTo},
+              enabled = ${advanceTo ? 1 : 0}
           WHERE id = ${row.id}
             AND (claimed_until IS NULL OR claimed_until < NOW())
         `,
@@ -301,20 +317,26 @@ export async function claimDueItems(
       );
       for (const row of blocked) {
         const tick = new Date(row.nextRunAt);
-        const next = computeNextRun(
+        const rawNext = computeNextRun(
           { cron: row.cron, scheduleIntervalSeconds: row.scheduleIntervalSeconds },
           new Date(),
           row.timezone,
         );
-        if (
-          (next && row.endsAt && next.getTime() > row.endsAt.getTime()) ||
-          (row.maxRuns != null && (blockedUsed.get(row.id) ?? 0) >= Number(row.maxRuns))
-        ) {
+        const next = await applyTaskHolidays(rawNext, row);
+        // maxRuns 用尽 → 不留痕停用；endsAt 按本轮 tick 判定（窗口内才处理）。
+        if (row.maxRuns != null && (blockedUsed.get(row.id) ?? 0) >= Number(row.maxRuns)) {
           await tx.$executeRaw(
             Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id}`,
           );
           continue;
         }
+        if (row.endsAt && tick.getTime() > row.endsAt.getTime()) {
+          await tx.$executeRaw(
+            Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id}`,
+          );
+          continue;
+        }
+        const advanceTo = next && row.endsAt && next.getTime() > row.endsAt.getTime() ? null : next;
         if (row.overlapPolicy === "run") {
           // 显式允许并行：无视租约强领（用户自担双跑风险）
           const claimed = await tx.$executeRaw(
@@ -322,8 +344,8 @@ export async function claimDueItems(
               UPDATE task
               SET claimed_by = ${workerId},
                   claimed_until = DATE_ADD(NOW(), INTERVAL ${leaseSeconds} SECOND),
-                  next_run_at = ${next},
-                  enabled = ${next ? 1 : 0}
+                  next_run_at = ${advanceTo},
+                  enabled = ${advanceTo ? 1 : 0}
               WHERE id = ${row.id}
             `,
           );
@@ -337,9 +359,9 @@ export async function claimDueItems(
           });
           continue;
         }
-        // 推进时刻（条件更新防并发复写），再按策略留痕
+        // 推进时刻（条件更新防并发复写），再按策略留痕；超窗则推进到 null 并停用
         const advanced = await tx.$executeRaw(
-          Prisma.sql`UPDATE task SET next_run_at = ${next}, enabled = ${next ? 1 : 0}
+          Prisma.sql`UPDATE task SET next_run_at = ${advanceTo}, enabled = ${advanceTo ? 1 : 0}
             WHERE id = ${row.id} AND next_run_at <= NOW()`,
         );
         if (advanced === 0) {
@@ -447,11 +469,14 @@ export async function advanceMissedRuns(now = new Date()): Promise<number> {
     },
     select: {
       id: true,
+      nextRunAt: true,
       cron: true,
       scheduleIntervalSeconds: true,
       timezone: true,
       endsAt: true,
       maxRuns: true,
+      skipHolidays: true,
+      holidayPolicy: true,
     },
   });
   if (missed.length === 0) {
@@ -472,12 +497,36 @@ export async function advanceMissedRuns(now = new Date()): Promise<number> {
   await Promise.all(
     missed.map((task) =>
       pool.run(async () => {
-        const next = computeNextRun(
+        const used = usedMap.get(task.id) ?? 0;
+        // maxRuns 用尽 → 直接停用（配额计已执行次数，本轮不欠执行）。
+        if (task.maxRuns != null && used >= Number(task.maxRuns)) {
+          await prisma.task.update({
+            where: { id: task.id },
+            data: { nextRunAt: null, enabled: false },
+          });
+          return;
+        }
+        // endsAt：本轮 tick 仍在窗口内 → 不动，留给领取循环执行（避免对账提前停用丢 tick）；
+        // tick 已超窗 → 停用。
+        if (task.endsAt) {
+          const tickTime = task.nextRunAt?.getTime();
+          if (tickTime == null || tickTime <= task.endsAt.getTime()) {
+            return;
+          }
+          await prisma.task.update({
+            where: { id: task.id },
+            data: { nextRunAt: null, enabled: false },
+          });
+          return;
+        }
+        const rawNext = computeNextRun(
           { cron: task.cron, scheduleIntervalSeconds: task.scheduleIntervalSeconds },
           now,
           task.timezone,
         );
-        if (endRuleExhausted(next, task.endsAt, task.maxRuns, usedMap.get(task.id) ?? 0)) {
+        const next = await applyTaskHolidays(rawNext, task);
+        // 到此 maxRuns/endsAt 已处理（上早退），只剩无下次 → 停用
+        if (!next) {
           await prisma.task.update({
             where: { id: task.id },
             data: { nextRunAt: null, enabled: false },
