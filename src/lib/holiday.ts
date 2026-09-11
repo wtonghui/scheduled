@@ -6,11 +6,14 @@ import { logger } from "./logger";
  * 节假日模块：唯一碰节假日 API 的地方。
  * API 形状变化只改 parseHolidayResponse；调用方只认 boolean | null。
  *
- * 假设A 契约：
+ * 真实契约（2026-09-11 实测返回确认）：
  *   请求 POST {HOLIDAY_API_URL}?appKey={HOLIDAY_API_APP_KEY}
  *   body {"params": {"natural_day": "YYYYMMDD"}}（natural_day 按任务时区墙钟日期）
- *   响应 {"code": 0, "data": {"isHoliday": true, "name": "国庆节"}}
- *   code 非 0 / 缺字段 / 解析失败 / 超时 / 连不通 → null（未知）。
+ *   响应 {"code":"0","msg":"OK","data":{"total":1,"rows":[{"natural_day":"20260909",
+ *     "is_workday":"Y", ...}]},"status":200,"success":true}
+ *   注意三点：① code 是字符串 "0"；② 没有 isHoliday 字段，看 rows[0].is_workday
+ *   （"Y"=工作日/"N"=假日）；③ data 包了一层 rows 数组。
+ *   空 rows / code 非 0 / 缺字段 / 解析失败 / 超时 / 连不通 → null（未知）。
  */
 
 export type HolidayPolicy = "drop" | "postpone";
@@ -37,22 +40,40 @@ export function toNaturalDay(date: Date, timezone: string): string {
 
 /**
  * 解析节假日 API 响应（形状变化只改这里）。
- * {"code": 0, "data": {"isHoliday": true}} → true/false；其他一切 → null。
+ * rows[0].is_workday === "Y" → 工作日（false）；=== "N" → 假日（true）；
+ * 其他一切（空 rows、code 非 0、缺字段、畸形）→ null。
  */
 export function parseHolidayResponse(json: unknown): boolean | null {
   if (!json || typeof json !== "object") {
     return null;
   }
   const root = json as Record<string, unknown>;
-  if (root.code !== 0) {
+  if (root.code !== "0" && root.code !== 0) {
+    return null;
+  }
+  if (root.success === false) {
     return null;
   }
   const data = root.data;
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     return null;
   }
-  const flag = (data as Record<string, unknown>).isHoliday;
-  return typeof flag === "boolean" ? flag : null;
+  const rows = (data as Record<string, unknown>).rows;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return null;
+  }
+  const first = rows[0];
+  if (!first || typeof first !== "object" || Array.isArray(first)) {
+    return null;
+  }
+  const flag = (first as Record<string, unknown>).is_workday;
+  if (flag === "Y") {
+    return false;
+  }
+  if (flag === "N") {
+    return true;
+  }
+  return null;
 }
 
 /** 节假日 API 是否配好（URL+KEY 缺任一即未启用）。 */

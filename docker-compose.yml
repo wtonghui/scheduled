@@ -26,5 +26,40 @@ services:
       retries: 10
       start_period: 20s
 
+  # OceanBase 社区版（MySQL 协议兼容），用途：与生产 OB 环境的兼容性验证
+  # （Prisma 迁移、SKIP LOCKED 退化路径、租约 SQL 等在 OB 下的行为）。
+  # 注意：
+  # - 默认 mini 模式（OB_MEMORY_LIMIT 6G）；本机共 8G 内存，与 mysql 服务同开偏紧，
+  #   若启动失败/OOM，先停 mysql（docker compose stop mysql）再试。
+  # - 首次启动初始化集群约需 2~5 分钟，用 docker logs -f scheduled-oceanbase 看进度。
+  # - mini 模式只保证 observer(2881) 可用；2883 按 obproxy 映射，mini 下可能无监听，不影响直连。
+  # - 应用直连 observer：mysql://root%40test:changeme@127.0.0.1:12881/scheduled
+  #   （用户名为 root@test，需 URL 编码 @ → %40；库/用户见下方首次初始化 SQL）。
+  # - 首次初始化（容器 ready 后执行一次）：
+  #     docker exec -it scheduled-oceanbase obclient -h127.0.0.1 -P2881 -uroot@test -pchangeme \
+  #       -e "CREATE DATABASE IF NOT EXISTS scheduled; CREATE USER IF NOT EXISTS 'scheduler'@'%' IDENTIFIED BY 'changeme'; GRANT ALL PRIVILEGES ON scheduled.* TO 'scheduler'@'%'; FLUSH PRIVILEGES;"
+  #   之后应用可用 mysql://scheduler:changeme@127.0.0.1:12881/scheduled 切库验证。
+  # - 版本探测注意：OB 的 VERSION() 返回 5.7.x-OceanBase-…，调度器的 SKIP LOCKED
+  #   版本探测会判为不支持，自动走「条件 UPDATE」可移植领取路径（正确性不受影响）。
+  oceanbase:
+    image: oceanbase/oceanbase-ce:latest
+    container_name: scheduled-oceanbase
+    restart: unless-stopped
+    environment:
+      MODE: mini
+      OB_CLUSTER_NAME: obcluster
+      OB_TENANT_NAME: test
+      OB_SYS_PASSWORD: rootpass
+      OB_TENANT_PASSWORD: changeme
+      OB_MEMORY_LIMIT: 6G
+      OB_SYSTEM_MEMORY: 1G
+      OB_DATAFILE_SIZE: 5G
+      OB_LOG_DISK_SIZE: 5G
+      TZ: Asia/Shanghai
+    ports:
+      - "12881:2881" # observer 直连（MySQL 协议）
+      - "12883:2883" # obproxy（mini 模式可能无监听）
+    # 数据目录待确认后挂载持久化卷；当前重建容器会丢数据（兼容验证库可接受）
+
 volumes:
   mysql_data:

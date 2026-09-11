@@ -13,19 +13,43 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("parseHolidayResponse (假设A)", () => {
-  it("parses code 0 + isHoliday true/false", () => {
-    expect(parseHolidayResponse({ code: 0, data: { isHoliday: true, name: "国庆节" } })).toBe(true);
-    expect(parseHolidayResponse({ code: 0, data: { isHoliday: false } })).toBe(false);
+/** 按真实返回拼响应：code 字符串 "0"，rows[0].is_workday Y/N。 */
+function realResponse(flag: unknown, extra: Record<string, unknown> = {}) {
+  return {
+    code: "0",
+    msg: "OK",
+    data: {
+      total: 1,
+      rows: [{ natural_day: "20260909", is_workday: flag, ...extra }],
+    },
+    status: 200,
+    success: true,
+    ...extra,
+  };
+}
+
+describe("parseHolidayResponse (真实形状)", () => {
+  it("is_workday Y → 工作日(false)，N → 假日(true)", () => {
+    expect(parseHolidayResponse(realResponse("Y"))).toBe(false);
+    expect(parseHolidayResponse(realResponse("N"))).toBe(true);
   });
 
-  it("returns null for non-zero code / missing shape", () => {
-    expect(parseHolidayResponse({ code: 1, data: { isHoliday: true } })).toBeNull();
-    expect(parseHolidayResponse({ code: 0, data: {} })).toBeNull();
-    expect(parseHolidayResponse({ code: 0 })).toBeNull();
+  it("returns null for non-zero code / success false / missing shape", () => {
+    expect(parseHolidayResponse({ ...realResponse("Y"), code: "1" })).toBeNull();
+    expect(parseHolidayResponse({ ...realResponse("Y"), success: false })).toBeNull();
+    expect(
+      parseHolidayResponse({ code: "0", msg: "OK", data: { total: 0, rows: [] }, success: true }),
+    ).toBeNull();
+    expect(parseHolidayResponse({ code: "0", msg: "OK", success: true })).toBeNull();
+    expect(parseHolidayResponse({ code: "0", msg: "OK", data: null, success: true })).toBeNull();
     expect(parseHolidayResponse(null)).toBeNull();
     expect(parseHolidayResponse("holiday")).toBeNull();
-    expect(parseHolidayResponse({ code: 0, data: { isHoliday: "yes" } })).toBeNull();
+    expect(parseHolidayResponse(realResponse("X"))).toBeNull();
+    expect(parseHolidayResponse(realResponse(1))).toBeNull();
+  });
+
+  it("accepts numeric code 0 (defensive)", () => {
+    expect(parseHolidayResponse({ ...realResponse("N"), code: 0 })).toBe(true);
   });
 });
 
@@ -47,11 +71,15 @@ function mockFetch(holidays: Set<string>, calls: string[]) {
       };
       const day = body.params?.natural_day ?? "";
       calls.push(day);
+      const isHoliday = holidays.has(day);
       return {
         ok: true,
         json: async () => ({
-          code: 0,
-          data: { isHoliday: holidays.has(day), name: holidays.has(day) ? "假" : "" },
+          code: "0",
+          msg: "OK",
+          data: { total: 1, rows: [{ natural_day: day, is_workday: isHoliday ? "N" : "Y" }] },
+          status: 200,
+          success: true,
         }),
       };
     }),
