@@ -1,5 +1,5 @@
-import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
+import type { Prisma } from "@prisma/client";
 
 /**
  * 通知查询（US4 / contracts §9 + W1）：严格按 tenant_id 隔离。
@@ -8,14 +8,20 @@ import { prisma } from "@/lib/db";
 const EMAIL_SELECT = {
   id: true,
   runId: true,
+  taskId: true,
   toAddress: true,
   subject: true,
+  html: true,
+  text: true,
   status: true,
   attempts: true,
   messageId: true,
   sentAt: true,
   lastError: true,
+  attachmentUrl: true,
+  systemUserId: true,
   createdAt: true,
+  updatedAt: true,
 } satisfies Prisma.EmailLogSelect;
 
 const WEBHOOK_SELECT = {
@@ -42,6 +48,40 @@ export async function listEmailLog(
   const where: Prisma.EmailLogWhereInput = {
     tenantId,
     ...(runId ? { runId } : {}),
+    ...(status ? { status: status as Prisma.EmailLogWhereInput["status"] } : {}),
+    ...(systemUserId ? { systemUserId } : {}),
+  };
+  const [rows, total] = await prisma.$transaction([
+    prisma.emailLog.findMany({
+      where,
+      select: EMAIL_SELECT,
+      orderBy: { createdAt: "desc" },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    }),
+    prisma.emailLog.count({ where }),
+  ]);
+  return { rows, total };
+}
+
+export async function listEmailLogByTask(
+  tenantId: string,
+  taskId: string,
+  page: number,
+  pageSize: number,
+  status?: string,
+  systemUserId?: string,
+) {
+  const task = await prisma.task.findFirst({
+    where: { id: taskId, tenantId },
+    select: { id: true },
+  });
+  if (!task) {
+    return { rows: [], total: 0 };
+  }
+  const where: Prisma.EmailLogWhereInput = {
+    tenantId,
+    taskId,
     ...(status ? { status: status as Prisma.EmailLogWhereInput["status"] } : {}),
     ...(systemUserId ? { systemUserId } : {}),
   };

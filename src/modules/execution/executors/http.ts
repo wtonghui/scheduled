@@ -337,6 +337,16 @@ export const httpExecutor: TaskExecutor = async ({
     if (triggerType != null) {
       headers["X-Trigger-Type"] = String(triggerType);
     }
+    logger.info(
+      {
+        taskId: task.id,
+        runId: runId ?? null,
+        triggerType: triggerType ?? null,
+        signTimestamp: timestampSec,
+        hasBody: rawBody.length > 0,
+      },
+      "task callback signed: X-Scheduled-Signature + X-Execution-Id + X-Trigger-Type attached",
+    );
   }
 
   for (;;) {

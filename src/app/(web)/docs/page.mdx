@@ -1,4 +1,4 @@
-﻿# 接口文档
+# 接口文档
 
 > 供外部系统把「定时任务能力」接到本平台。端点前缀 `api/v1`，响应统一信封（错误码见 [§8](#envelope)）。
 
@@ -111,6 +111,7 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | 结果 | <Method method="GET" /> | `/api/v1/executions` | `tasks:read` |
 | 结果 | <Method method="GET" /> | `/api/v1/tasks/:id/webhook-deliveries` | `tasks:read` |
 | 结果 | <Method method="GET" /> | `/api/v1/email-log` | `tasks:read` |
+| 结果 | <Method method="GET" /> | `/api/v1/tasks/:id/email-logs` | `tasks:read` |
 
 <Note>
 
@@ -136,6 +137,9 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `startsAt` | string \| null | 开始时刻（ISO）；首跑从此起算 |
 | `skipHolidays` | boolean | 到点遇假日是否跳过/顺延 |
 | `holidayPolicy` | string | `drop` 作废 / `postpone` 顺延 |
+| `overlapPolicy` | string | 重叠策略：`skip`（默认）/ `queue` / `run` |
+| `endsAt` | string \| null | 重复调度截止时刻 |
+| `maxRuns` | number \| null | 重复调度总次数上限 |
 | `taskType` | `http` \| `noop` | 执行器类型 |
 | `payload` | object | 执行负载（`http` 型见下，`noop` 型为 `{}`） |
 | `enabled` | boolean | 是否启用；`false` 时不再调度 |
@@ -144,6 +148,9 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `recipients` | string[] | 终态邮件收件人 |
 | `notifyOn` | string[] | 触发通知的终态：`succeeded` / `failed` / `succeeded_with_results` |
 | `webhookUrl` | string \| null | 终态 Webhook 回调地址 |
+| `emailSubjectTemplate` | string \| null | 邮件标题模板（`{placeholder}` 渲染） |
+| `emailBodyTemplate` | string \| null | 邮件正文模板 |
+| `emailAttachmentUrlTemplate` | string \| null | 附件 URL 模板 |
 | `nextRunAt` | string \| null | 下次触发时间 |
 | `version` | number | 乐观并发版本号；`PATCH` 必须带当前值，冲突返回 `409` |
 | `createdAt` / `updatedAt` | string | 创建 / 最后修改时间 |
@@ -214,17 +221,22 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `id` | string | 日志 id |
+| `id` | string | 日志 id（BigInt 序列化为字符串） |
 | `runId` | string | 关联运行 id |
+| `taskId` | string | 关联任务 id |
 | `toAddress` | string | 收件人邮箱 |
 | `subject` | string | 邮件主题（含任务名与结果） |
+| `html` | string \| null | 渲染后 HTML 正文（outbox 持久化，中继不依赖任务行） |
+| `text` | string \| null | 渲染后纯文本正文 |
 | `status` | string | `pending` / `in_progress` / `sent` / `failed` / `dead` |
 | `attempts` | number | 已尝试次数 |
 | `messageId` | string \| null | 邮件服务返回的 message-id |
 | `sentAt` | string \| null | 发送时间 |
 | `lastError` | string \| null | 失败摘要 |
+| `attachmentUrl` | string \| null | 模板引擎渲染好的附件下载 URL |
 | `systemUserId` | string \| null | 系统内用户标识 |
 | `createdAt` | string | 创建时间 |
+| `updatedAt` | string | 最后修改时间 |
 
 <h2 id="endpoint-details">5 · 接口详情</h2>
 
@@ -388,6 +400,9 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `notifyOn` | string[] | 否 | 默认 `["succeeded","failed"]` |
 | `webhookUrl` | string | 否 | 终态回调地址 |
 | `systemUserId` | string | 否 | 系统内用户标识（≤191 字符）；也可通过请求头 `X-System-User-Id` 传入 |
+| `emailSubjectTemplate` | string | 否 | 邮件标题模板（≤255），`{path}` 从响应数据取值渲染 |
+| `emailBodyTemplate` | string | 否 | 邮件正文模板（≤10000），同上 |
+| `emailAttachmentUrlTemplate` | string | 否 | 附件 URL 模板（≤512），渲染后持久化 |
 
 <Note>
 
@@ -680,6 +695,26 @@ curl "http://localhost:3000/api/v1/email-log?page=1&pageSize=20" \
 **成功（200）**：每项为「邮件日志对象」+ `meta`。
 
 **失败**：`401` / `403`。
+
+<Endpoint id="ep-email-logs-task" method="GET" path="/api/v1/tasks/:id/email-logs" name="单任务邮件投递历史" />
+
+查看某任务各次运行触发的邮件投递记录（含 HTML / 纯文本正文）。
+
+| 参数 | 说明 |
+|------|------|
+| `id`（path） | 任务 id |
+| `status` | `pending` / `in_progress` / `sent` / `failed` / `dead` |
+| `page` / `pageSize` | 分页 |
+| `system_user_id` | 按系统内用户筛选 |
+
+```bash
+curl http://localhost:3000/api/v1/tasks/cmt6yqpo50003m0vispoa9p9h/email-logs?pageSize=20 \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+**成功（200）**：每项为「邮件日志对象」（含 `html` / `text` / `attachmentUrl`）+ `meta`。
+
+**失败**：`401` / `403` / `404`。
 
 <h2 id="schedule">6 · 调度规则</h2>
 

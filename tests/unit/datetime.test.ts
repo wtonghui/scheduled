@@ -41,6 +41,12 @@ describe("serializeDates", () => {
     expect(serializeDates("x")).toBe("x");
   });
 
+  it("converts BigInt values to strings (JSON-safe)", () => {
+    const out = serializeDates({ id: 9007199254740993n, name: "t" }) as Record<string, unknown>;
+    expect(out.id).toBe("9007199254740993");
+    expect(typeof out.id).toBe("string");
+  });
+
   it("does not dismantle non-plain objects such as Buffer", () => {
     const buf = Buffer.from([1, 2, 3]);
     expect(serializeDates(buf)).toBe(buf);

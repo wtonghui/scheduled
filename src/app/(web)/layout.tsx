@@ -17,6 +17,7 @@ import { useState } from "react";
 
 const NAV_ITEMS = [
   { href: "/tasks", label: "任务" },
+  { href: "/emails", label: "邮件" },
   { href: "/docs", label: "接口文档" },
   { href: "/tokens", label: "API 令牌" },
 ];

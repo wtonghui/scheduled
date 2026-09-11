@@ -23,6 +23,7 @@ export function serializeDates(value: unknown): unknown {
 }
 
 function walk(value: unknown, seen: WeakSet<object>): unknown {
+  if (typeof value === "bigint") return value.toString();
   if (value instanceof Date) return toBeijingIso(value);
   if (value === null || typeof value !== "object") return value;
   if (seen.has(value)) return null; // 环引用兜底（Prisma 行不会出现）：断环防栈溢出

@@ -259,6 +259,9 @@ export default function TaskDetailPage() {
             <Button variant="primary" size="sm" onClick={save} disabled={busy}>
               {busy ? "保存中…" : "保存"}
             </Button>
+            <Button asChild variant="secondary" size="sm">
+              <Link href={`/tasks/${task.id}/emails`}>邮件记录</Link>
+            </Button>
             <Button variant="secondary" size="sm" onClick={runNow}>
               立即运行
             </Button>
