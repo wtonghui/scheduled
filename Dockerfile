@@ -35,6 +35,7 @@ COPY --from=build /app/.next ./.next
 COPY --from=build /app/prisma ./prisma
 COPY --from=build /app/src ./src
 COPY --from=build /app/worker ./worker
+COPY --from=build /app/scripts ./scripts
 COPY ecosystem.config.cjs ./
 # 根配置文件：prisma.config（migrate 读 DB URL）、tsconfig（tsx 解析 @/ 别名）、next.config
 COPY --from=build /app/prisma.config.ts ./

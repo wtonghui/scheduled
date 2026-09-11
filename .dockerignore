@@ -16,6 +16,5 @@ tests
 tests-e2e
 specs
 docs
-scripts
 playwright.config.*
 *.md
