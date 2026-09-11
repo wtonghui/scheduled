@@ -18,6 +18,8 @@ export const logger = pino({
       "payload.headers.authorization",
       "payload.body",
       "webhookSecret",
+      "execSignSecret",
+      "TASK_CALLBACK_SIGN_SECRET",
       "PAYLOAD_ENCRYPTION_KEY",
       "SMTP_PASS",
     ],

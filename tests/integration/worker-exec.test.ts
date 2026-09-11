@@ -1,8 +1,10 @@
 import http from "node:http";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { config } from "../../src/lib/config";
 import { prisma } from "../../src/lib/db";
 import { registerDefaultExecutors } from "../../src/modules/execution/register";
 import { runTaskWithScheduledAt } from "../../src/modules/execution/service";
+import { verifyWebhook } from "../../src/modules/webhook/signature";
 import { createRunner } from "../../worker/runner";
 import {
   advanceMissedRuns,
@@ -19,49 +21,55 @@ import { cleanupTenant, createTestTask, createTestTenant, createTestToken } from
 
 let server: http.Server;
 let baseUrl: string;
-const requests: Array<{ url: string; headers: http.IncomingHttpHeaders }> = [];
+const requests: Array<{ url: string; headers: http.IncomingHttpHeaders; body: string }> = [];
 
 function startServer(): Promise<string> {
   return new Promise((resolve) => {
     server = http.createServer((req, res) => {
-      requests.push({ url: req.url ?? "", headers: req.headers });
-      if (req.url?.startsWith("/ok")) {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-        return;
-      }
-      if (req.url?.startsWith("/text")) {
-        res.writeHead(200, { "content-type": "text/plain" });
-        res.end("pong");
-        return;
-      }
-      if (req.url?.startsWith("/retry")) {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "boom" }));
-        return;
-      }
-      if (req.url?.startsWith("/not-found")) {
-        res.writeHead(404, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "missing" }));
-        return;
-      }
-      if (req.url?.startsWith("/slow")) {
-        setTimeout(() => {
-          res.writeHead(200);
-          res.end("ok");
-        }, 3000);
-        return;
-      }
-      if (req.url?.startsWith("/sse")) {
-        // text/event-stream：分多个 chunk 逐步推送（模拟 LLM agent 流式输出）
-        res.writeHead(200, { "content-type": "text/event-stream" });
-        res.write('data: {"step":1}\n\n');
-        setTimeout(() => res.write('data: {"step":2}\n\n'), 10);
-        setTimeout(() => res.end("data: [DONE]\n\n"), 20);
-        return;
-      }
-      res.writeHead(418);
-      res.end();
+      let rawBody = "";
+      req.on("data", (c) => {
+        rawBody += c;
+      });
+      req.on("end", () => {
+        requests.push({ url: req.url ?? "", headers: req.headers, body: rawBody });
+        if (req.url?.startsWith("/ok")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        if (req.url?.startsWith("/text")) {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.end("pong");
+          return;
+        }
+        if (req.url?.startsWith("/retry")) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "boom" }));
+          return;
+        }
+        if (req.url?.startsWith("/not-found")) {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "missing" }));
+          return;
+        }
+        if (req.url?.startsWith("/slow")) {
+          setTimeout(() => {
+            res.writeHead(200);
+            res.end("ok");
+          }, 3000);
+          return;
+        }
+        if (req.url?.startsWith("/sse")) {
+          // text/event-stream：分多个 chunk 逐步推送（模拟 LLM agent 流式输出）
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write('data: {"step":1}\n\n');
+          setTimeout(() => res.write('data: {"step":2}\n\n'), 10);
+          setTimeout(() => res.end("data: [DONE]\n\n"), 20);
+          return;
+        }
+        res.writeHead(418);
+        res.end();
+      });
     });
     server.listen(0, "127.0.0.1", () => {
       const address = server.address();
@@ -373,5 +381,73 @@ describe("worker execution", () => {
     const taskAfter = await prisma.task.findUnique({ where: { id: task.id } });
     expect(taskAfter?.claimedBy).toBeNull();
     expect(taskAfter?.claimedUntil).toBeNull();
+  });
+
+  it("signs task callback headers (scheduled → trigger 1, runId matches)", async () => {
+    const task = await createTestTask(tenantId, { taskType: "noop" });
+    const outcome = await runTaskWithScheduledAt(
+      taskFor(task.id, { url: `${baseUrl}/ok`, method: "POST", body: '{"a":1}' }),
+      new Date(),
+      "scheduled",
+    );
+    expect(outcome.status).toBe("succeeded");
+    expect(requests).toHaveLength(1);
+    const hit = requests[0]!;
+    const headers = hit.headers;
+    expect(headers["x-scheduled-signature"]).toMatch(/^t=\d+,v1=[0-9a-f]{64}$/);
+    expect(headers["x-execution-id"]).toBe(outcome.executionId);
+    expect(headers["x-trigger-type"]).toBe("1");
+    // 对方口径验签：t.body 用实际收到的精确字节（含 POST body）
+    const verdict = verifyWebhook(
+      hit.body,
+      headers["x-scheduled-signature"] as string,
+      config.TASK_CALLBACK_SIGN_SECRET as string,
+    );
+    expect(verdict.valid).toBe(true);
+  });
+
+  it("manual run-now signs trigger 2 and platform headers override user headers", async () => {
+    const task = await createTestTask(tenantId, { taskType: "noop" });
+    const exec = await prisma.taskExecution.create({
+      data: {
+        taskId: task.id,
+        idempotencyKey: `${task.id}:manual-sign:a1`,
+        scheduledAt: new Date(),
+        attempt: 1,
+        trigger: "manual",
+        status: "pending",
+      },
+    });
+    const outcome = await runTaskWithScheduledAt(
+      taskFor(task.id, {
+        url: `${baseUrl}/ok`,
+        headers: { "X-Execution-Id": "fake", "X-Trigger-Type": "9" },
+      }),
+      new Date(),
+      "manual",
+      { executionId: exec.id },
+    );
+    expect(outcome.status).toBe("succeeded");
+    const headers = requests[0]!.headers;
+    expect(headers["x-trigger-type"]).toBe("2");
+    expect(headers["x-execution-id"]).toBe(outcome.executionId);
+    expect(headers["x-execution-id"]).not.toBe("fake");
+  });
+
+  it("retry attempt signs trigger 3", async () => {
+    const task = await createTestTask(tenantId, { taskType: "noop" });
+    const outcome = await runTaskWithScheduledAt(
+      taskFor(
+        task.id,
+        { url: `${baseUrl}/retry` },
+        { maxAttempts: 2, retryDelayMs: 0, timeoutMs: 1000 },
+      ),
+      new Date(),
+      "scheduled",
+    );
+    expect(outcome.status).toBe("dead");
+    expect(requests).toHaveLength(2);
+    expect(requests[0]!.headers["x-trigger-type"]).toBe("1");
+    expect(requests[1]!.headers["x-trigger-type"]).toBe("3");
   });
 });

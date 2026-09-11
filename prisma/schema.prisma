@@ -67,6 +67,7 @@ model Task {
   notifyOn                Json            @default("[\"succeeded\",\"failed\"]") @map("notify_on")
   webhookUrl              String?         @map("webhook_url") @db.Text
   webhookSecret           Bytes?          @map("webhook_secret") // HMAC 密钥（加密存储）
+  execSignSecret          Bytes?          @map("exec_sign_secret") // 任务执行请求签名密钥（加密存储；Phase 2 对方按任务验签后启用，当前取值恒走 env）
   emailSubjectTemplate    String?         @map("email_subject_template") @db.VarChar(255)
   emailBodyTemplate       String?         @map("email_body_template") @db.Text
   emailAttachmentUrlTemplate String?      @map("email_attachment_url_template") @db.VarChar(512)

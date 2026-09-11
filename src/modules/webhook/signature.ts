@@ -7,13 +7,25 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 const SIGNATURE_PREFIX = "t=";
 
-export function signWebhook(body: string | Buffer, secret: string): string {
-  const timestamp = Math.floor(Date.now() / 1000);
+/**
+ * 任务执行请求签名（对接 sqleditor execute-callback）与 Webhook 出站签名同构：
+ * `X-Scheduled-Signature: t=<unix>,v1=<hmac-sha256(t<body>, secret)>`。
+ * 纯函数（时间可注入），签名向量可测；空 body 按 "" 参与签名。
+ */
+export function buildTaskSignature(
+  secret: string,
+  timestampSec: number,
+  rawBody: string | Buffer,
+): string {
   const signature = createHmac("sha256", secret)
-    .update(`${timestamp}.`)
-    .update(body)
+    .update(`${timestampSec}.`)
+    .update(rawBody)
     .digest("hex");
-  return `${SIGNATURE_PREFIX}${timestamp},v1=${signature}`;
+  return `${SIGNATURE_PREFIX}${timestampSec},v1=${signature}`;
+}
+
+export function signWebhook(body: string | Buffer, secret: string): string {
+  return buildTaskSignature(secret, Math.floor(Date.now() / 1000), body);
 }
 
 export interface VerifiedSignature {
@@ -37,10 +49,7 @@ export function verifyWebhook(
   }
   const timestamp = Number(match[1]);
   const provided = match[2]!;
-  const expected = createHmac("sha256", secret)
-    .update(`${timestamp}.`)
-    .update(body)
-    .digest("hex");
+  const expected = createHmac("sha256", secret).update(`${timestamp}.`).update(body).digest("hex");
   const providedBuf = Buffer.from(provided, "hex");
   const expectedBuf = Buffer.from(expected, "hex");
   const now = Math.floor(Date.now() / 1000);

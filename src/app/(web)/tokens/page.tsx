@@ -40,7 +40,7 @@ export default function TokensPage() {
   const [error, setError] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [name, setName] = useState("");
-  const [scopes, setScopes] = useState("tasks:read,tasks:write");
+  const [scopes, setScopes] = useState("tasks:read,tasks:write,tokens:manage");
   const [created, setCreated] = useState<string | null>(null);
   const { toast } = useToast();
   const confirm = useConfirm();

@@ -1,8 +1,9 @@
 import { DEFAULT_TIMEZONE, computeNextRun } from "@/lib/cron";
-import { decryptJson, encryptJson, encryptSecret, generateWebhookSecret } from "@/lib/crypto";
+import { decryptJson, decryptSecret, encryptJson, encryptSecret, generateWebhookSecret } from "@/lib/crypto";
 import { prisma } from "@/lib/db";
 import { AppError } from "@/lib/errors";
 import { adjustForHolidays, isHolidayConfigured, type HolidayPolicy } from "@/lib/holiday";
+import { logger } from "@/lib/logger";
 import { checkUrlForSsrf } from "@/lib/ssrf";
 import type { Prisma } from "@prisma/client";
 import {
@@ -375,6 +376,10 @@ export async function create(
     emailAttachmentUrlTemplate: data.emailAttachmentUrlTemplate ?? null,
     ...(data.systemUserId ? { systemUserId: data.systemUserId } : {}),
     webhookSecret: data.webhookUrl ? new Uint8Array(encryptSecret(generateWebhookSecret())) : null,
+    // 任务执行请求签名密钥：每个 http 任务自动生成（加密存）；取值恒走 env（对方单密钥验签），
+    // Phase 2 对方按任务验签后启用本列
+    execSignSecret:
+      data.taskType === "http" ? new Uint8Array(encryptSecret(generateWebhookSecret())) : null,
     nextRunAt,
   });
   return toView(row);
@@ -651,4 +656,57 @@ export async function runTaskNow(tenantId: string, taskId: string) {
     }
     throw error;
   }
+}
+
+/**
+ * 密钥交接读取（供接收方验签）：仅 api-token + 租户隔离（跨租户 404，不泄露存在性）。
+ * 读到明文即记审计；CRUD 永远不返回密钥的铁律不变。
+ */
+export async function getSignSecrets(
+  tenantId: string,
+  id: string,
+): Promise<{ taskId: string; webhookSecret: string | null; execSignSecret: string | null }> {
+  const row = await prisma.task.findFirst({
+    where: { id, tenantId },
+    select: { id: true, webhookSecret: true, execSignSecret: true },
+  });
+  if (!row) {
+    throw new AppError(404, "NOT_FOUND", "task not found");
+  }
+  logger.info({ task_id: id }, "sign secrets viewed");
+  return {
+    taskId: row.id,
+    webhookSecret: row.webhookSecret ? decryptSecret(new Uint8Array(row.webhookSecret)) : null,
+    execSignSecret: row.execSignSecret ? decryptSecret(new Uint8Array(row.execSignSecret)) : null,
+  };
+}
+
+/**
+ * 密钥轮换：生成新密钥并明文返回一次；在途 outbox 快照行照旧（只影响之后入 outbox 的）。
+ * 轮换必须跟接收方约同一分钟操作，否则窗口期内对方验签 401。
+ */
+export async function rotateSignSecret(
+  tenantId: string,
+  id: string,
+  key: "webhookSecret" | "execSignSecret",
+): Promise<{ taskId: string; key: string; secret: string }> {
+  const existing = await prisma.task.findFirst({ where: { id, tenantId } });
+  if (!existing) {
+    throw new AppError(404, "NOT_FOUND", "task not found");
+  }
+  if (key === "webhookSecret" && !existing.webhookUrl) {
+    throw new AppError(400, "VALIDATION", "no webhook configured, nothing to rotate");
+  }
+  if (key === "execSignSecret" && existing.taskType !== "http") {
+    throw new AppError(400, "VALIDATION", "only http tasks carry an exec sign secret");
+  }
+  const secret = generateWebhookSecret();
+  const encrypted = new Uint8Array(encryptSecret(secret));
+  if (key === "webhookSecret") {
+    await prisma.task.updateMany({ where: { id, tenantId }, data: { webhookSecret: encrypted } });
+  } else {
+    await prisma.task.updateMany({ where: { id, tenantId }, data: { execSignSecret: encrypted } });
+  }
+  logger.warn({ task_id: id, key }, "sign secret rotated");
+  return { taskId: id, key, secret };
 }

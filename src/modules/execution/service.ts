@@ -41,6 +41,8 @@ export interface RunTaskDefinition {
   webhookUrl: string | null;
   webhookSecret: Uint8Array | null;
   systemUserId?: string | null;
+  /** 任务执行请求签名密钥（加密字节；Phase 2 对方按任务验签后启用，当前取值恒走 env） */
+  execSignSecret?: Uint8Array | null;
   /** 邮件标题模板；null=默认标题 */
   emailSubjectTemplate?: string | null;
   /** 邮件正文模板（HTML）；null=默认 React Email */
@@ -170,6 +172,7 @@ export async function runTaskWithScheduledAt(
       payload: task.payload,
       payloadSecrets: task.payloadSecrets,
       timeoutMs: task.timeoutMs,
+      execSignSecret: task.execSignSecret ?? null,
     },
     attempt: 1,
     signal: new AbortController().signal,
@@ -203,8 +206,12 @@ export async function runTaskWithScheduledAt(
     try {
       // onProgress 由执行器在流式取得进展时调用 → withTimeout 重置空闲计时器（长流续命）；
       // externalSignal 为进程级中止（如 shutdown 超时强杀）
+      // 回调触发类型（sqleditor 约定）：重试 attempt（失败后重新执行）→ 3，
+      // 否则 manual → 2，scheduled → 1
+      const triggerType = attempt > 1 ? 3 : trigger === "manual" ? 2 : 1;
       const execResult = await withTimeout(
-        (signal, onProgress) => executor({ ...input, attempt, signal, onProgress }),
+        (signal, onProgress) =>
+          executor({ ...input, attempt, signal, onProgress, runId: execution.id, triggerType }),
         task.timeoutMs,
         opts.externalSignal,
       );

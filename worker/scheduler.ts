@@ -47,6 +47,7 @@ interface DueRow {
   emailSubjectTemplate: string | null;
   emailBodyTemplate: string | null;
   emailAttachmentUrlTemplate: string | null;
+  execSignSecret: Uint8Array | string | null;
 }
 
 function parseJsonColumn(value: unknown, fallback: unknown = {}): unknown {
@@ -88,6 +89,7 @@ function toTaskDefinition(row: DueRow): RunTaskDefinition {
     emailSubjectTemplate: row.emailSubjectTemplate,
     emailBodyTemplate: row.emailBodyTemplate,
     emailAttachmentUrlTemplate: row.emailAttachmentUrlTemplate,
+    execSignSecret: toBytes(row.execSignSecret),
   };
 }
 
@@ -102,7 +104,8 @@ const TASK_COLUMNS = Prisma.sql`
   webhook_url AS webhookUrl, webhook_secret AS webhookSecret,
   email_subject_template AS emailSubjectTemplate,
   email_body_template AS emailBodyTemplate,
-  email_attachment_url_template AS emailAttachmentUrlTemplate
+  email_attachment_url_template AS emailAttachmentUrlTemplate,
+  exec_sign_secret AS execSignSecret
 `;
 
 /** 已消耗的调度次数：attempt=1 且 trigger 为调度触发的行；run-now/重试行/跳过行不计（D3/D4）。

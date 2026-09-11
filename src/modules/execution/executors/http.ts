@@ -1,7 +1,9 @@
-import { decryptJson } from "@/lib/crypto";
+import { config } from "@/lib/config";
+import { decryptJson, decryptSecret } from "@/lib/crypto";
 import { HttpError } from "@/lib/errors";
 import { logger } from "@/lib/logger";
 import { MAX_REDIRECTS, checkUrlForSsrf } from "@/lib/ssrf";
+import { buildTaskSignature } from "@/modules/webhook/signature";
 import type { TaskExecutor } from "../registry";
 
 /**
@@ -38,6 +40,24 @@ function logSafeUrl(url: string): string {
   u.search = "";
   u.hash = "";
   return u.toString();
+}
+
+/**
+ * 签名密钥解析：env 共享密钥优先（对方单密钥验签，只能用它）；
+ * env 未配则回退任务自生成密钥（对方升级成按任务验签后启用）。
+ * 都没有 → null（不签名，原样发出）。
+ */
+export function resolveSignSecret(
+  envSecret: string | undefined,
+  perTaskBytes?: Uint8Array | null,
+): string | null {
+  if (envSecret) {
+    return envSecret;
+  }
+  if (perTaskBytes) {
+    return decryptSecret(perTaskBytes);
+  }
+  return null;
 }
 
 type StreamMode = "sse" | "ndjson";
@@ -254,7 +274,14 @@ async function readStreamBody(
   return { stream: true, streamMode: mode, events, bytes, truncated, data: parts };
 }
 
-export const httpExecutor: TaskExecutor = async ({ task, signal, attempt, onProgress }) => {
+export const httpExecutor: TaskExecutor = async ({
+  task,
+  signal,
+  attempt,
+  onProgress,
+  runId,
+  triggerType,
+}) => {
   const payload = (task.payload ?? {}) as Record<string, unknown>;
   const url = payload.url as string | undefined;
   if (!url) {
@@ -293,6 +320,23 @@ export const httpExecutor: TaskExecutor = async ({ task, signal, attempt, onProg
   };
   if (bodyValue !== undefined && bodyValue !== null && method !== "GET" && method !== "HEAD") {
     fetchInit.body = String(bodyValue);
+  }
+
+  // 调度平台回调签名（对接 sqleditor execute-callback）：env 有密钥即全量附带三头。
+  // rawBody 取实际发出的精确字节（无 body 按 ""，与对方"空 body 签 t."口径一致）；
+  // 平台头覆盖同名用户头；重定向复用同一 fetchInit（t 在对方 300s 容忍窗内有效）。
+  // 密钥与签名值永不进日志（本函数所有日志均不含 headers）。
+  const signSecret = resolveSignSecret(config.TASK_CALLBACK_SIGN_SECRET, task.execSignSecret);
+  if (signSecret) {
+    const rawBody = typeof fetchInit.body === "string" ? fetchInit.body : "";
+    const timestampSec = Math.floor(Date.now() / 1000);
+    headers["X-Scheduled-Signature"] = buildTaskSignature(signSecret, timestampSec, rawBody);
+    if (runId) {
+      headers["X-Execution-Id"] = runId;
+    }
+    if (triggerType != null) {
+      headers["X-Trigger-Type"] = String(triggerType);
+    }
   }
 
   for (;;) {

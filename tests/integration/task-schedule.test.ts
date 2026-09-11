@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { decryptSecret } from "../../src/lib/crypto";
 import { prisma } from "../../src/lib/db";
 import * as taskService from "../../src/modules/task/service";
 import { claimDueItems } from "../../worker/scheduler";
@@ -499,5 +500,115 @@ describe("startsAt + holidays (integration)", () => {
       version: created.version,
     });
     expect(updated.skipHolidays).toBe(false);
+  });
+});
+
+describe("sign secret exchange (integration)", () => {
+  let tenantId: string;
+  let otherTenantId: string;
+  let ownerTokenId: string;
+
+  beforeAll(async () => {
+    const t = await createTestTenant("sched-sign");
+    tenantId = t.id;
+    const o = await createTestTenant("sched-sign-other");
+    otherTenantId = o.id;
+    ownerTokenId = (await createTestToken(tenantId, ["tasks:read", "tasks:write"], "owner")).id;
+  });
+
+  afterAll(async () => {
+    await cleanupTenant(tenantId);
+    await cleanupTenant(otherTenantId);
+  });
+
+  it("reads both secrets for http task with webhookUrl", async () => {
+    const created = await taskService.create(tenantId, ownerTokenId, {
+      name: "sign-read",
+      cron: "* * * * *",
+      taskType: "http",
+      payload: { url: "https://example.com/hook" },
+      recipients: ["ops@example.com"],
+      webhookUrl: "https://example.com/webhook",
+    });
+    const secrets = await taskService.getSignSecrets(tenantId, created.id);
+    expect(secrets.taskId).toBe(created.id);
+    expect(secrets.webhookSecret).toMatch(/^[0-9a-f]{64}$/);
+    expect(secrets.execSignSecret).toMatch(/^[0-9a-f]{64}$/);
+    // 与库里密文解密一致
+    const row = await prisma.task.findUnique({ where: { id: created.id } });
+    const dbWebhook = row?.webhookSecret ? decryptSecret(new Uint8Array(row.webhookSecret)) : null;
+    const dbExec = row?.execSignSecret ? decryptSecret(new Uint8Array(row.execSignSecret)) : null;
+    expect(dbWebhook).toBe(secrets.webhookSecret);
+    expect(dbExec).toBe(secrets.execSignSecret);
+  });
+
+  it("returns null webhookSecret without webhookUrl; 404 cross-tenant/unknown", async () => {
+    const created = await taskService.create(tenantId, ownerTokenId, {
+      name: "sign-naked",
+      cron: "* * * * *",
+      taskType: "http",
+      payload: { url: "https://example.com/hook" },
+      recipients: ["ops@example.com"],
+    });
+    const secrets = await taskService.getSignSecrets(tenantId, created.id);
+    expect(secrets.webhookSecret).toBeNull();
+    expect(secrets.execSignSecret).toMatch(/^[0-9a-f]{64}$/);
+    await expect(taskService.getSignSecrets(otherTenantId, created.id)).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      status: 404,
+    });
+    await expect(taskService.getSignSecrets(tenantId, "does-not-exist")).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      status: 404,
+    });
+  });
+
+  it("rotates webhookSecret; new enqueues use new, old snapshot untouched", async () => {
+    const created = await taskService.create(tenantId, ownerTokenId, {
+      name: "sign-rotate",
+      cron: "* * * * *",
+      taskType: "http",
+      payload: { url: "https://example.com/hook" },
+      recipients: ["ops@example.com"],
+      webhookUrl: "https://example.com/webhook",
+    });
+    const before = await taskService.getSignSecrets(tenantId, created.id);
+    const rotated = await taskService.rotateSignSecret(tenantId, created.id, "webhookSecret");
+    expect(rotated.key).toBe("webhookSecret");
+    expect(rotated.secret).toMatch(/^[0-9a-f]{64}$/);
+    expect(rotated.secret).not.toBe(before.webhookSecret);
+    const after = await taskService.getSignSecrets(tenantId, created.id);
+    expect(after.webhookSecret).toBe(rotated.secret);
+    // exec 密钥不受影响
+    expect(after.execSignSecret).toBe(before.execSignSecret);
+  });
+
+  it("rotate rejects meaningless targets → 400/404", async () => {
+    const httpTask = await taskService.create(tenantId, ownerTokenId, {
+      name: "sign-rotate-naked",
+      cron: "* * * * *",
+      taskType: "http",
+      payload: { url: "https://example.com/hook" },
+      recipients: ["ops@example.com"],
+    });
+    await expect(
+      taskService.rotateSignSecret(tenantId, httpTask.id, "webhookSecret"),
+    ).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+    const noopTask = await taskService.create(tenantId, ownerTokenId, {
+      name: "sign-rotate-noop",
+      cron: "* * * * *",
+      taskType: "noop",
+      payload: {},
+      recipients: ["ops@example.com"],
+    });
+    await expect(
+      taskService.rotateSignSecret(tenantId, noopTask.id, "execSignSecret"),
+    ).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+    await expect(
+      taskService.rotateSignSecret(tenantId, "does-not-exist", "webhookSecret"),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", status: 404 });
+    await expect(
+      taskService.rotateSignSecret(otherTenantId, httpTask.id, "execSignSecret"),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", status: 404 });
   });
 });

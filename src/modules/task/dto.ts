@@ -246,6 +246,14 @@ export const UpdateTaskSchema = z
 
 export type UpdateTaskInput = z.infer<typeof UpdateTaskSchema>;
 
+/** 密钥交接：读/转供接收方验签的任务密钥（webhookSecret / execSignSecret 二选一）。 */
+export const RotateSignSecretSchema = z.object({
+  key: z.enum(["webhookSecret", "execSignSecret"], {
+    error: "key must be webhookSecret or execSignSecret",
+  }),
+});
+export type RotateSignSecretInput = z.infer<typeof RotateSignSecretSchema>;
+
 /** 校验 payload 与 taskType 匹配（I/O 边界 fail-fast）。 */
 export function validatePayloadForType(
   taskType: "http" | "noop",

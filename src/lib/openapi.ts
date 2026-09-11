@@ -128,6 +128,53 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/v1/tasks/{id}/sign-secrets",
+  summary: "Get task sign secrets (plaintext, audited)",
+  tags: ["tasks"],
+  parameters: [idParam],
+  responses: {
+    200: { description: "secrets", content: { "application/json": { schema: SuccessAny } } },
+    401: {
+      description: "unauthorized",
+      content: { "application/json": { schema: ErrorEnvelope } },
+    },
+    404: { description: "not found", content: { "application/json": { schema: ErrorEnvelope } } },
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/v1/tasks/{id}/sign-secrets/rotate",
+  summary: "Rotate a task sign secret (returns new plaintext once)",
+  tags: ["tasks"],
+  parameters: [idParam],
+  request: {
+    body: {
+      content: {
+        "application/json": {
+          schema: {
+            type: "object",
+            required: ["key"],
+            properties: {
+              key: { type: "string", enum: ["webhookSecret", "execSignSecret"] },
+            },
+          },
+        },
+      },
+    },
+  },
+  responses: {
+    200: { description: "rotated", content: { "application/json": { schema: SuccessAny } } },
+    400: {
+      description: "validation error",
+      content: { "application/json": { schema: ErrorEnvelope } },
+    },
+    404: { description: "not found", content: { "application/json": { schema: ErrorEnvelope } } },
+  },
+});
+
+registry.registerPath({
   method: "patch",
   path: "/api/v1/tasks/{id}",
   summary: "Update task (optimistic concurrency via version)",

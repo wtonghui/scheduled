@@ -17,6 +17,8 @@ process.env.TOKEN_PREFIX ??= "sche-";
 // 必须无条件覆盖（不能用 ??=，否则 .env 配了 smtp 就会向真实 SMTP 外发邮件——
 // 慢、依赖外部服务，还会触发服务商限流；且无网环境下中继恒失败导致用例挂）。
 process.env.MAIL_PROVIDER = "json";
+// 任务执行请求签名测试用共享密钥（生产由运维在 .env 配真实值）
+process.env.TASK_CALLBACK_SIGN_SECRET ??= "test-callback-sign-secret-0123456789abcdef";
 process.env.LOG_LEVEL ??= "info";
 
 // 仅测试环境：允许 worker 调用本地测试 HTTP 服务器（生产默认关闭）

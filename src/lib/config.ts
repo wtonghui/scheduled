@@ -75,6 +75,14 @@ const EnvSchema = z.object({
     .optional()
     .transform((v) => (v === undefined || v.trim() === "" ? undefined : v)),
   HOLIDAY_API_TIMEOUT_MS: z.coerce.number().int().min(1000).max(30000).default(5000),
+
+  // 任务执行请求签名（对接 sqleditor execute-callback 用）：与对方约定的共享密钥。
+  // 可选；不配则回退到各任务自生成的密钥（对方需升级成按任务验签才能用，否则配了才通）。
+  // 空字符串视为未配置。
+  TASK_CALLBACK_SIGN_SECRET: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined || v.trim() === "" ? undefined : v)),
 });
 
 const parsed = EnvSchema.safeParse(process.env);
