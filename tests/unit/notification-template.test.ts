@@ -60,4 +60,26 @@ describe("renderTaskEmail with user templates (flattened data context)", () => {
     expect(out.html).toContain("ex-test-001");
     expect(out.attachmentUrl).toBeNull();
   });
+
+  it("appends a download link when the body lacks the attachment url", async () => {
+    const out = await renderTaskEmail(summary, {
+      subject: " done",
+      body: "共 {rowCount} 行",
+      attachmentUrl: "{fileUrl}",
+    });
+    expect(out.html).toContain("附件下载");
+    expect(out.html).toContain('href="https://minio.example.com/scheduled-task/xxx/result.xlsx"');
+    expect(out.text).toContain(
+      "附件下载：https://minio.example.com/scheduled-task/xxx/result.xlsx",
+    );
+  });
+
+  it("does not duplicate the link when the body already contains the url", async () => {
+    const out = await renderTaskEmail(summary, {
+      subject: "任务完成 — {rowCount} 行",
+      body: '共 {rowCount} 行<br><a href="{fileUrl}">下载文件</a>',
+      attachmentUrl: "{fileUrl}",
+    });
+    expect(out.html.match(/附件下载/g) ?? []).toHaveLength(0);
+  });
 });

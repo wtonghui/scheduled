@@ -51,6 +51,27 @@ const EnvSchema = z.object({
   WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(200).default(50),
   SHUTDOWN_GRACE_MS: z.coerce.number().int().min(0).default(10000),
 
+  // 通知中继（outbox）：并发/批量/超时/认领回收阈值，生产按水位调参无需重新部署
+  // 邮件与 webhook 分离池：SMTP 慢不拖 webhook，反之亦然
+  RELAY_EMAIL_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(5),
+  RELAY_WEBHOOK_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(5),
+  RELAY_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(20),
+  WEBHOOK_FETCH_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(15000),
+  OUTBOX_STALE_MS: z.coerce.number().int().min(60000).default(600000),
+  // webhook 按域熔断：同 host 连续失败达阈值即熔断冷却，避免重试风暴
+  RELAY_BREAKER_THRESHOLD: z.coerce.number().int().min(2).max(20).default(5),
+  RELAY_BREAKER_COOLDOWN_MS: z.coerce.number().int().min(5000).max(600000).default(60000),
+  // 同 host 最大并行：防单个慢下游占满全局池
+  RELAY_PER_HOST_LIMIT: z.coerce.number().int().min(1).max(16).default(2),
+  // 附件内联上限（字节）：relay 下载后直接贴进邮件；超限只嵌链接不下载；0=纯链接模式。
+  // base64 膨胀约 37%：2MB 附件≈2.7MB 邮件，SES/postfix 10MB 上限下安全；硬顶 10MB。
+  ATTACHMENT_INLINE_MAX_BYTES: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(10 * 1024 * 1024)
+    .default(2 * 1024 * 1024),
+
   // SSRF：允许访问内网 URL（RFC1918/loopback/linkLocal IP）。内网自用部署设 "true"；元数据地址等结构检查始终保留。
   SSRF_ALLOW_PRIVATE: z
     .enum(["true", "false"])

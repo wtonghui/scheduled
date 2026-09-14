@@ -1,4 +1,6 @@
 import { prisma } from "@/lib/db";
+import { AppError } from "@/lib/errors";
+import { logger } from "@/lib/logger";
 import type { Prisma } from "@prisma/client";
 
 /**
@@ -133,4 +135,80 @@ export async function listWebhookDeliveries(
     prisma.webhookDelivery.count({ where }),
   ]);
   return { rows, total };
+}
+
+/** outbox 主键（BigInt）解析：非法字符串 → 400，不走到 DB。 */
+function parseOutboxId(raw: string): bigint {
+  if (!/^\d+$/.test(raw)) {
+    throw new AppError(400, "VALIDATION", `invalid outbox id: ${raw}`);
+  }
+  return BigInt(raw);
+}
+
+const REDRIVE_EMAIL_SELECT = {
+  id: true,
+  runId: true,
+  taskId: true,
+  status: true,
+  attempts: true,
+  nextRetryAt: true,
+  updatedAt: true,
+} satisfies Prisma.EmailLogSelect;
+
+const REDRIVE_WEBHOOK_SELECT = {
+  id: true,
+  runId: true,
+  status: true,
+  attempts: true,
+  nextRetryAt: true,
+  updatedAt: true,
+} satisfies Prisma.WebhookDeliverySelect;
+
+/**
+ * 死信重投（P1-2）：dead → pending，attempts 归零（重给一轮机会），nextRetryAt 清空（立刻可领），
+ * lastError 保留不断链。条件 UPDATE 保证原子：并发双点只有一个生效，另一个见 pending → 409。
+ * 跨租户查不到一律 404（与查询接口同规矩）。
+ */
+export async function redriveEmail(idRaw: string, tenantId: string, tokenId: string) {
+  const id = parseOutboxId(idRaw);
+  const updated = await prisma.emailLog.updateMany({
+    where: { id, tenantId, status: "dead" },
+    data: { status: "pending", attempts: 0, nextRetryAt: null },
+  });
+  if (updated.count === 0) {
+    const existing = await prisma.emailLog.findFirst({
+      where: { id, tenantId },
+      select: { status: true },
+    });
+    if (!existing) {
+      throw new AppError(404, "NOT_FOUND", "email log not found");
+    }
+    throw new AppError(409, "NOT_DEAD", `only dead rows can be redriven (status=${existing.status})`);
+  }
+  logger.warn({ tenantId, tokenId, emailLogId: id.toString() }, "email redriven from dead to pending");
+  return prisma.emailLog.findUniqueOrThrow({ where: { id }, select: REDRIVE_EMAIL_SELECT });
+}
+
+/** 同 redriveEmail，对象为 webhook_delivery。 */
+export async function redriveWebhook(idRaw: string, tenantId: string, tokenId: string) {
+  const id = parseOutboxId(idRaw);
+  const updated = await prisma.webhookDelivery.updateMany({
+    where: { id, tenantId, status: "dead" },
+    data: { status: "pending", attempts: 0, nextRetryAt: null },
+  });
+  if (updated.count === 0) {
+    const existing = await prisma.webhookDelivery.findFirst({
+      where: { id, tenantId },
+      select: { status: true },
+    });
+    if (!existing) {
+      throw new AppError(404, "NOT_FOUND", "webhook delivery not found");
+    }
+    throw new AppError(409, "NOT_DEAD", `only dead rows can be redriven (status=${existing.status})`);
+  }
+  logger.warn(
+    { tenantId, tokenId, webhookDeliveryId: id.toString() },
+    "webhook redriven from dead to pending",
+  );
+  return prisma.webhookDelivery.findUniqueOrThrow({ where: { id }, select: REDRIVE_WEBHOOK_SELECT });
 }

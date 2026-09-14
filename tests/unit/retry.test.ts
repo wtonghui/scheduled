@@ -29,6 +29,27 @@ describe("classifyError", () => {
     expect(classifyError({ status: 422 } as Error)).toBe("permanent");
   });
 
+  it("classifies SMTP response codes (P0-1)", () => {
+    // 4xx 瞬断（灰名单/限流）→ 重试；5xx（收件人不存在）→ 永久
+    const grey = Object.assign(new Error("greylisted"), {
+      code: "EENVELOPE",
+      responseCode: 451,
+    });
+    expect(classifyError(grey)).toBe("retryable");
+    const refused = Object.assign(new Error("mailbox unavailable"), {
+      code: "EENVELOPE",
+      responseCode: 550,
+    });
+    expect(classifyError(refused)).toBe("permanent");
+    // nodemailer 连接层错误 → 重试
+    expect(classifyError(Object.assign(new Error("socket"), { code: "ESOCKET" }))).toBe(
+      "retryable",
+    );
+    expect(classifyError(Object.assign(new Error("conn"), { code: "ECONNECTION" }))).toBe(
+      "retryable",
+    );
+  });
+
   it("treats prisma P2034 as retryable", () => {
     expect(classifyError(Object.assign(new Error("deadlock"), { code: "P2034" }))).toBe(
       "retryable",

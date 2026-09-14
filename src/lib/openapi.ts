@@ -288,6 +288,32 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/v1/email-log/{id}/redrive",
+  summary: "Redrive a dead email (dead → pending, tasks:write)",
+  tags: ["notifications"],
+  parameters: [idParam],
+  responses: {
+    200: { description: "redriven row", content: { "application/json": { schema: SuccessAny } } },
+    404: { description: "not found", content: { "application/json": { schema: ErrorEnvelope } } },
+    409: { description: "not dead", content: { "application/json": { schema: ErrorEnvelope } } },
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/v1/webhook-deliveries/{id}/redrive",
+  summary: "Redrive a dead webhook delivery (dead → pending, tasks:write)",
+  tags: ["notifications"],
+  parameters: [idParam],
+  responses: {
+    200: { description: "redriven row", content: { "application/json": { schema: SuccessAny } } },
+    404: { description: "not found", content: { "application/json": { schema: ErrorEnvelope } } },
+    409: { description: "not dead", content: { "application/json": { schema: ErrorEnvelope } } },
+  },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/v1/healthz",
   summary: "Liveness",

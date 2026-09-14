@@ -3,7 +3,8 @@ import os from "node:os";
 import { config } from "../src/lib/config";
 import { prisma } from "../src/lib/db";
 import { logger } from "../src/lib/logger";
-import { outboxPending, workerHeartbeats } from "../src/lib/metrics";
+import { outboxDead, outboxFailed, outboxHealedTotal, outboxPending, outboxPendingByTenant, workerHeartbeats } from "../src/lib/metrics";
+import { healMissingOutbox } from "../src/modules/notification/service";
 import { registerDefaultExecutors } from "../src/modules/execution/register";
 import { runEmailRelayOnce } from "./relay";
 import { createRunner } from "./runner";
@@ -38,6 +39,7 @@ const runner = createRunner(config.WORKER_MAX_CONCURRENCY, {
   abortSignal: shutdownController.signal,
 });
 let shuttingDown = false;
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -69,19 +71,67 @@ async function heartbeat(): Promise<void> {
 
     // 孤儿对账：死 worker 遗留 running → failed（不重跑，防双副作用）；清过期认领
     await reconcileOrphanExecutions();
+
+    // 历史坏账自愈：终态缺 outbox 行 → 幂等补插；慢通道 60s 一次，不跟每次心跳
+    if (Date.now() - lastHealAt > HEAL_INTERVAL_MS) {
+      lastHealAt = Date.now();
+      try {
+        const healed = await healMissingOutbox();
+        if (healed > 0) {
+          outboxHealedTotal.inc(healed);
+          logger.warn({ healed }, "healed missing outbox rows");
+        }
+      } catch (error) {
+        logger.warn({ err: (error as Error).message }, "heal missing outbox failed");
+      }
+    }
   } catch (error) {
     logger.warn({ err: (error as Error).message }, "heartbeat failed");
   }
 }
 
-/** 输出 outbox 待投递水位（中继通道内刷新）。 */
+/** 自愈节流：慢通道 60s 一次。 */
+const HEAL_INTERVAL_MS = 60_000;
+let lastHealAt = 0;
+
+/** 输出 outbox 待投递水位（中继通道内刷新）：pending=待投+在途，failed=等重试，dead=需手工 redrive。 */
+const knownOutboxTenants = new Set<string>();
 async function refreshOutboxGauge(): Promise<void> {
   try {
-    const [email, webhook] = await Promise.all([
-      prisma.emailLog.count({ where: { status: "pending" } }),
-      prisma.webhookDelivery.count({ where: { status: "pending" } }),
+    const [emailGroups, webhookGroups, emailByTenant, webhookByTenant] = await Promise.all([
+      prisma.emailLog.groupBy({ by: ["status"], _count: { status: true } }),
+      prisma.webhookDelivery.groupBy({ by: ["status"], _count: { status: true } }),
+      prisma.emailLog.groupBy({ by: ["tenantId", "status"], _count: { _all: true } }),
+      prisma.webhookDelivery.groupBy({ by: ["tenantId", "status"], _count: { _all: true } }),
     ]);
-    outboxPending.set(email + webhook);
+    const sum = (groups: Array<{ status: string; _count: { status: number } }>, keys: string[]) =>
+      groups
+        .filter((g) => keys.includes(g.status))
+        .reduce((acc, g) => acc + g._count.status, 0);
+    outboxPending.set(
+      sum(emailGroups, ["pending", "in_progress"]) + sum(webhookGroups, ["pending", "in_progress"]),
+    );
+    outboxFailed.set(sum(emailGroups, ["failed"]) + sum(webhookGroups, ["failed"]));
+    outboxDead.set(sum(emailGroups, ["dead"]) + sum(webhookGroups, ["dead"]));
+    // 分租户水位（公平 skew 信号，P1-3）：只留有积压的租户，排空的删 label 防残留
+    const seen = new Set<string>();
+    const pendingByTenant = new Map<string, number>();
+    for (const g of [...emailByTenant, ...webhookByTenant]) {
+      if (g.status === "pending" || g.status === "in_progress") {
+        pendingByTenant.set(g.tenantId, (pendingByTenant.get(g.tenantId) ?? 0) + g._count._all);
+      }
+    }
+    for (const [tenant, value] of pendingByTenant) {
+      outboxPendingByTenant.set({ tenant }, value);
+      seen.add(tenant);
+      knownOutboxTenants.add(tenant);
+    }
+    for (const tenant of knownOutboxTenants) {
+      if (!seen.has(tenant)) {
+        outboxPendingByTenant.remove(tenant);
+        knownOutboxTenants.delete(tenant);
+      }
+    }
   } catch {
     // 指标刷新失败不中断
   }
@@ -112,15 +162,23 @@ async function runLoop(): Promise<void> {
 }
 
 /** 中继后台通道：邮件 + Webhook 并行处理（与领取/执行解耦），独立节拍。 */
+let currentRelayRound: Promise<void> | null = null;
 async function relayLoop(): Promise<void> {
   while (!shuttingDown) {
     const started = Date.now();
-    try {
-      void refreshOutboxGauge();
-      await Promise.allSettled([runEmailRelayOnce(20), runWebhookRelayOnce(20)]);
-    } catch (error) {
-      logger.error({ err: (error as Error).message }, "relay cycle failed (will retry)");
-    }
+    currentRelayRound = (async () => {
+      try {
+        void refreshOutboxGauge();
+        await Promise.allSettled([
+          runEmailRelayOnce(config.RELAY_BATCH_SIZE),
+          runWebhookRelayOnce(config.RELAY_BATCH_SIZE),
+        ]);
+      } catch (error) {
+        logger.error({ err: (error as Error).message }, "relay cycle failed (will retry)");
+      }
+    })();
+    await currentRelayRound;
+    currentRelayRound = null;
     if (!shuttingDown) {
       await sleep(Math.max(100, INTERVAL_MS - (Date.now() - started)));
     }
@@ -133,12 +191,29 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   }
   shuttingDown = true;
   logger.info({ signal }, "worker draining");
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+  }
   // 超过宽限仍未排空 → 强杀在途执行（abort 后执行器抛错、快速终态）
   const forceAbort = setTimeout(() => {
     logger.warn("drain grace exceeded; aborting in-flight tasks");
     shutdownController.abort();
   }, config.SHUTDOWN_GRACE_MS);
   await runner.drain(config.SHUTDOWN_GRACE_MS + 2000);
+  // 排空中继在途轮次：已认领的 outbox 行落终态后再断连，否则变 in_progress 孤儿等 10 分钟回收
+  const pendingRelay = currentRelayRound;
+  if (pendingRelay) {
+    let relayDone = false;
+    await Promise.race([
+      pendingRelay.then(() => {
+        relayDone = true;
+      }),
+      sleep(Math.min(5000, config.SHUTDOWN_GRACE_MS)),
+    ]);
+    if (!relayDone) {
+      logger.warn("relay drain timed out with round still in flight");
+    }
+  }
   clearTimeout(forceAbort);
   await prisma.workerLease
     .update({
@@ -187,7 +262,7 @@ async function main(): Promise<void> {
     logger.info({ reconciled }, "reconciled orphan executions after restart");
   }
 
-  void setInterval(() => void heartbeat(), Math.max(5000, INTERVAL_MS * 2));
+  void (heartbeatTimer = setInterval(() => void heartbeat(), Math.max(5000, INTERVAL_MS * 2)));
   await heartbeat();
 
   // 中继走独立后台通道，与领取解耦

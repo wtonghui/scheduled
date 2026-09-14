@@ -24,8 +24,14 @@ export class PickupMailService implements MailService {
         text: req.text,
       });
       return { messageId: info.messageId ?? null, status: "sent" };
-    } catch {
-      return { messageId: null, status: "failed" };
+    } catch (error) {
+      // 本地 sendmail 失败多为环境问题，透传原始 error 供 relay 分类（默认 permanent）
+      return {
+        messageId: null,
+        providerResponse: (error as Error).message?.slice(0, 500),
+        status: "failed",
+        error,
+      };
     }
   }
 }

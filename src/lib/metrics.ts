@@ -45,9 +45,45 @@ export const emailFailedTotal = new Counter({
   help: "emails failed/dead by the relay",
 });
 
+export const webhookSentTotal = new Counter({
+  name: "scheduled_webhook_sent_total",
+  help: "webhooks delivered by the relay",
+});
+
+export const webhookFailedTotal = new Counter({
+  name: "scheduled_webhook_failed_total",
+  help: "webhooks failed/dead by the relay",
+});
+
 export const outboxPending = new Gauge({
   name: "scheduled_outbox_pending",
   help: "pending rows in email_log + webhook_delivery outboxes",
+});
+
+export const outboxFailed = new Gauge({
+  name: "scheduled_outbox_failed",
+  help: "failed (retryable, awaiting retry) rows in email_log + webhook_delivery outboxes",
+});
+
+export const outboxDead = new Gauge({
+  name: "scheduled_outbox_dead",
+  help: "dead-lettered rows in email_log + webhook_delivery outboxes (need redrive)",
+});
+
+export const webhookBreakersOpen = new Gauge({
+  name: "scheduled_webhook_breakers_open",
+  help: "currently open webhook per-host breakers (shared across pods when backed by Redis)",
+});
+
+export const outboxPendingByTenant = new Gauge({
+  name: "scheduled_outbox_pending_by_tenant",
+  help: "pending+in_progress outbox rows by tenant (fairness skew signal)",
+  labelNames: ["tenant"],
+});
+
+export const outboxHealedTotal = new Counter({
+  name: "scheduled_outbox_healed_total",
+  help: "outbox rows backfilled by the heal job",
 });
 
 export const workerHeartbeats = new Counter({

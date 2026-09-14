@@ -34,6 +34,11 @@ export interface SendResult {
   messageId: string | null;
   providerResponse?: string;
   status: "sent" | "failed";
+  /**
+   * 原始错误透传（P0-1）：适配器 catch 后不再吞错，relay 用它做重试分类。
+   * 成功时为 undefined；失败时为抛出的原始 Error（含 code/responseCode）。
+   */
+  error?: unknown;
 }
 
 export interface MailService {

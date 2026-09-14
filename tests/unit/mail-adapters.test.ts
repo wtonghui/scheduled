@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { config } from "../../src/lib/config";
+import { HttpError } from "../../src/lib/errors";
 
 const fakeTransporter = {
   verify: vi.fn(async () => undefined),
@@ -42,11 +43,15 @@ describe("SmtpMailService", async () => {
   });
 
   it("returns failed status when provider throws", async () => {
-    fakeTransporter.sendMail.mockRejectedValueOnce(new Error("smtp down"));
+    const thrown = Object.assign(new Error("smtp down"), { code: "ECONNECTION" });
+    fakeTransporter.sendMail.mockRejectedValueOnce(thrown);
     const svc = new SmtpMailService();
     const result = await svc.send({ to: ["a@x.io"], subject: "s", html: "h", text: "t" });
     expect(result.status).toBe("failed");
     expect(result.messageId).toBeNull();
+    // P0-1：透传原始 error，relay 可据 code 分类重试
+    expect(result.error).toBe(thrown);
+    expect(result.providerResponse).toMatch(/ECONNECTION/);
   });
 });
 
@@ -93,6 +98,9 @@ describe("HttpMailService", async () => {
       text: "t",
     });
     expect(result.status).toBe("failed");
+    // P0-1：非 2xx 透传带 status 的 HttpError，relay 可判 5xx 重试
+    expect(result.error).toBeInstanceOf(HttpError);
+    expect((result.error as HttpError).status).toBe(500);
   });
 });
 

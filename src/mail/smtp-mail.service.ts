@@ -62,8 +62,20 @@ export class SmtpMailService implements MailService {
       });
       return { messageId: info.messageId ?? null, providerResponse: info.response, status: "sent" };
     } catch (error) {
-      logger.error({ err: (error as Error).message }, "smtp send failed");
-      return { messageId: null, providerResponse: "smtp error", status: "failed" };
+      const err = error as { code?: unknown; responseCode?: unknown; message?: string };
+      const code = typeof err?.code === "string" ? err.code : undefined;
+      const responseCode = typeof err?.responseCode === "number" ? err.responseCode : undefined;
+      const detail = [
+        err?.message ?? String(error),
+        code ? `code=${code}` : null,
+        responseCode !== undefined ? `responseCode=${responseCode}` : null,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .slice(0, 500);
+      logger.error({ err: (error as Error).message, code, responseCode }, "smtp send failed");
+      // 透传原始 error：relay 据 code/responseCode 判可重试（421/连接瞬断）还是永久（550）
+      return { messageId: null, providerResponse: detail, status: "failed", error };
     }
   }
 }

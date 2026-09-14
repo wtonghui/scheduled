@@ -1,4 +1,5 @@
 import { config } from "@/lib/config";
+import { HttpError, TimeoutError } from "@/lib/errors";
 import { logger } from "@/lib/logger";
 import type { MailRequest, SendResult, MailService } from "./port";
 
@@ -15,11 +16,12 @@ export class HttpMailService implements MailService {
 
   async send(req: MailRequest): Promise<SendResult> {
     if (!config.MAIL_HTTP_URL) {
-      return { messageId: null, status: "failed" };
+      const error = new Error("MAIL_HTTP_URL is required for provider=http");
+      return { messageId: null, status: "failed", error };
     }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), config.MAIL_HTTP_TIMEOUT_MS);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), config.MAIL_HTTP_TIMEOUT_MS);
       const res = await fetch(config.MAIL_HTTP_URL, {
         method: "POST",
         headers: {
@@ -43,13 +45,27 @@ export class HttpMailService implements MailService {
       });
       clearTimeout(timer);
       if (!res.ok) {
-        throw new Error(`http mail provider responded ${res.status}`);
+        // 带状态码的 HttpError：relay 据 429/5xx 重试、4xx 进死信（此前 message 字符串分类器看不到）
+        throw new HttpError(res.status, `http mail provider responded ${res.status}`);
       }
       const body = (await res.json().catch(() => ({}))) as { messageId?: string };
       return { messageId: body.messageId ?? null, status: "sent" };
     } catch (error) {
+      clearTimeout(timer);
+      const name = (error as { name?: string }).name ?? "";
+      const normalized =
+        error instanceof HttpError
+          ? error
+          : name === "TimeoutError" || name === "AbortError"
+            ? new TimeoutError(`http mail timed out after ${config.MAIL_HTTP_TIMEOUT_MS}ms`)
+            : error;
       logger.error({ err: (error as Error).message }, "http mail send failed");
-      return { messageId: null, status: "failed" };
+      return {
+        messageId: null,
+        providerResponse: (error as Error).message?.slice(0, 500),
+        status: "failed",
+        error: normalized,
+      };
     }
   }
 }

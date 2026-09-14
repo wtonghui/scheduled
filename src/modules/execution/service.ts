@@ -13,7 +13,8 @@ import { classifyError, computeRetryDelayMs } from "@/lib/retry";
 import {
   type NotifyContext,
   type RunSummary,
-  enqueueNotificationsFromRun,
+  prepareNotificationOutbox,
+  writePreparedOutbox,
 } from "@/modules/notification/service";
 import type { Prisma } from "@prisma/client";
 import { type TaskExecutorInput, getExecutor } from "./registry";
@@ -107,7 +108,7 @@ interface FinalizeFields {
   error?: Prisma.InputJsonValue;
 }
 
-/** 终态更新 + 通知 outbox 同一事务（run_id 唯一幂等）。 */
+/** 终态更新 + 通知 outbox 同一事务（run_id 唯一幂等）。渲染在事务外，DB 瞬时冲突退避重试。 */
 async function finalizeExecution(
   executionId: string,
   fields: FinalizeFields,
@@ -116,46 +117,80 @@ async function finalizeExecution(
   errorMessage: string | null,
   executorResult?: unknown,
 ): Promise<void> {
-  await prisma.$transaction(async (tx) => {
-    await tx.taskExecution.update({
-      where: { id: executionId },
-      data: {
-        status: fields.status,
-        startedAt: fields.startedAt,
-        finishedAt: fields.finishedAt,
-        durationMs: fields.durationMs,
-        ...(fields.error !== undefined ? { error: fields.error } : {}),
-      },
-    });
-
-    // 防御：缺省通知上下文（测试/手工构造定义时）→ 不通知、不报错
-    const notifyCtx: NotifyContext = {
-      tenantId: task.tenantId ?? "",
-      taskId: task.id,
-      taskName: task.taskName ?? task.id,
-      recipients: task.recipients ?? [],
-      notifyOn: task.notifyOn ?? [],
-      webhookUrl: task.webhookUrl ?? null,
-      webhookSecretBytes: task.webhookSecret ?? null,
-      systemUserId: task.systemUserId ?? null,
-      emailSubjectTemplate: task.emailSubjectTemplate ?? null,
-      emailBodyTemplate: task.emailBodyTemplate ?? null,
-      emailAttachmentUrlTemplate: task.emailAttachmentUrlTemplate ?? null,
-    };
-    const summary: RunSummary = {
-      executionId,
-      taskId: task.id,
-      taskName: task.taskName,
-      status: fields.status === "succeeded" ? "succeeded" : "failed",
-      scheduledAt,
-      startedAt: fields.startedAt,
-      finishedAt: fields.finishedAt,
-      durationMs: fields.durationMs,
-      errorMessage: errorMessage ?? null,
-      result: executorResult,
-    };
-    await enqueueNotificationsFromRun(notifyCtx, summary, tx);
-  });
+  // 防御：缺省通知上下文（测试/手工构造定义时）→ 不通知、不报错
+  const notifyCtx: NotifyContext = {
+    tenantId: task.tenantId ?? "",
+    taskId: task.id,
+    taskName: task.taskName ?? task.id,
+    recipients: task.recipients ?? [],
+    notifyOn: task.notifyOn ?? [],
+    webhookUrl: task.webhookUrl ?? null,
+    webhookSecretBytes: task.webhookSecret ?? null,
+    systemUserId: task.systemUserId ?? null,
+    emailSubjectTemplate: task.emailSubjectTemplate ?? null,
+    emailBodyTemplate: task.emailBodyTemplate ?? null,
+    emailAttachmentUrlTemplate: task.emailAttachmentUrlTemplate ?? null,
+  };
+  const summary: RunSummary = {
+    executionId,
+    taskId: task.id,
+    taskName: task.taskName,
+    status: fields.status === "succeeded" ? "succeeded" : "failed",
+    scheduledAt,
+    startedAt: fields.startedAt,
+    finishedAt: fields.finishedAt,
+    durationMs: fields.durationMs,
+    errorMessage: errorMessage ?? null,
+    result: executorResult,
+  };
+  // 事务外预渲染：CPU 活不持 DB 锁；模板坏了只记日志不阻塞终态
+  let prepared = null;
+  try {
+    prepared = await prepareNotificationOutbox(notifyCtx, summary);
+  } catch (error) {
+    logger.error(
+      { err: (error as Error).message, execution_id: executionId },
+      "notification render failed, finalizing without outbox",
+    );
+    prepared = null;
+  }
+  // 瞬时 DB 冲突（P2034/P2028）退避重试 3 次，防抖动丢终态
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const preparedSnapshot = prepared;
+      await prisma.$transaction(async (tx) => {
+        await tx.taskExecution.update({
+          where: { id: executionId },
+          data: {
+            status: fields.status,
+            startedAt: fields.startedAt,
+            finishedAt: fields.finishedAt,
+            durationMs: fields.durationMs,
+            ...(fields.error !== undefined ? { error: fields.error } : {}),
+          },
+        });
+        try {
+          await writePreparedOutbox(notifyCtx, summary, preparedSnapshot, tx);
+        } catch (error) {
+          if ((error as { code?: string }).code === "P2002") {
+            return;
+          }
+          throw error;
+        }
+      });
+      return;
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      lastError = error;
+      if ((code === "P2034" || code === "P2028") && attempt < 3) {
+        await new Promise((r) => setTimeout(r, computeRetryDelayMs(200, attempt - 1)));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError;
 }
 
 export async function runTaskWithScheduledAt(

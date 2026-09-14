@@ -7,11 +7,13 @@ import { TimeoutError, HttpError } from "./errors";
 
 export type RetryVerdict = "retryable" | "permanent";
 
-/** 网络瞬时错误码（Node/undici）→ 可重试。 */
+/** 网络瞬时错误码（Node/undici/nodemailer）→ 可重试。ECONNECTION/ESOCKET 为 nodemailer 连接层错误。 */
 const RETRYABLE_NETWORK_CODES = new Set([
   "ECONNRESET",
   "ECONNREFUSED",
   "ECONNABORTED",
+  "ECONNECTION",
+  "ESOCKET",
   "ETIMEDOUT",
   "EHOSTUNREACH",
   "ENETUNREACH",
@@ -28,18 +30,34 @@ const RETRYABLE_NETWORK_CODES = new Set([
 
 /**
  * 错误分类：决定是否重试。
- * - 可重试：网络瞬时、超时、429/5xx、DB 死锁/锁等待（P2034）。
- * - 永久：4xx（除 429）、Zod 校验、程序 bug。
+ * - 可重试：网络瞬时、超时、429/5xx、SMTP 4xx（421/451/452）、DB 死锁/锁等待（P2034）。
+ * - 永久：4xx（除 429）、SMTP 5xx（550 等）、Zod 校验、程序 bug。
  */
 export function classifyError(error: unknown): RetryVerdict {
   if (error instanceof TimeoutError) {
     return "retryable";
   }
 
-  const err = error as { code?: unknown; status?: unknown; name?: string } | null;
+  const err = error as {
+    code?: unknown;
+    status?: unknown;
+    responseCode?: unknown;
+    name?: string;
+  } | null;
 
   if (err && typeof err.code === "string" && RETRYABLE_NETWORK_CODES.has(err.code)) {
     return "retryable";
+  }
+
+  // SMTP 响应码（nodemailer responseCode）：4xx=瞬断（421/451/452 灰名单/限流）可重试，5xx=永久。
+  // 优先级高于 code：EENVELOPE+421 应重试，EENVELOPE+550 应死信。
+  if (err && typeof err.responseCode === "number") {
+    if (err.responseCode >= 400 && err.responseCode < 500) {
+      return "retryable";
+    }
+    if (err.responseCode >= 500) {
+      return "permanent";
+    }
   }
 
   // Prisma 事务冲突 / 写冲突 → 可重试
