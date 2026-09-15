@@ -243,7 +243,8 @@ describe("end rules + overlap policy (integration)", () => {
     });
     await prisma.task.update({
       where: { id: created.id },
-      data: { nextRunAt: new Date(Date.now() - 1_000) },
+      // 配额唯一依据是计数列（直接插执行行不走 service，不触发递增，此处显式置数模拟）
+      data: { nextRunAt: new Date(Date.now() - 1_000), consumedRuns: 1 },
     });
     const items = await claimDueItems("sched-policy-worker", 30, 10);
     expect(items.some((i) => i.task.id === created.id)).toBe(false);
@@ -351,6 +352,41 @@ describe("end rules + overlap policy (integration)", () => {
       where: { taskId: created.id, trigger: "queued", status: "pending" },
     });
     expect(queued).not.toBeNull();
+  });
+
+  it("queue policy coalesces to keep only the newest pending (A1)", async () => {
+    const created = await taskService.create(tenantId, ownerTokenId, {
+      name: "queue-coalesce",
+      cron: "* * * * *",
+      overlapPolicy: "queue",
+      taskType: "noop",
+      payload: {},
+      recipients: ["ops@example.com"],
+    });
+    await holdLease(created.id, "queue");
+    const tick1 = new Date(Date.now() - 60_000);
+    await prisma.task.update({ where: { id: created.id }, data: { nextRunAt: tick1 } });
+    await claimDueItems("sched-policy-worker", 30, 10);
+    const first = await prisma.taskExecution.findFirst({
+      where: { taskId: created.id, trigger: "queued", status: "pending" },
+      orderBy: { scheduledAt: "asc" },
+    });
+    expect(first?.scheduledAt.getTime()).toBe(tick1.getTime());
+
+    // 上游仍在跑（租约有效）→ 新 tick2 到点：旧排队行翻 skipped，只留最新 pending
+    const tick2 = new Date(Date.now() - 20_000);
+    await prisma.task.update({ where: { id: created.id }, data: { nextRunAt: tick2 } });
+    await claimDueItems("sched-policy-worker", 30, 10);
+
+    const pending = await prisma.taskExecution.findMany({
+      where: { taskId: created.id, trigger: "queued", status: "pending" },
+    });
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.scheduledAt.getTime()).toBe(tick2.getTime());
+    const superseded = await prisma.taskExecution.findFirst({
+      where: { taskId: created.id, idempotencyKey: `${created.id}:${tick1.toISOString()}:queued` },
+    });
+    expect(superseded?.status).toBe("skipped");
   });
 
   it("run policy force-claims despite the lease", async () => {

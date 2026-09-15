@@ -6,6 +6,7 @@ import { logger } from "../src/lib/logger";
 import { outboxDead, outboxFailed, outboxHealedTotal, outboxPending, outboxPendingByTenant, workerHeartbeats } from "../src/lib/metrics";
 import { healMissingOutbox } from "../src/modules/notification/service";
 import { registerDefaultExecutors } from "../src/modules/execution/register";
+import { runArchiveOnce } from "./archive";
 import { runEmailRelayOnce } from "./relay";
 import { createRunner } from "./runner";
 import {
@@ -85,6 +86,20 @@ async function heartbeat(): Promise<void> {
         logger.warn({ err: (error as Error).message }, "heal missing outbox failed");
       }
     }
+
+    // retention 归档：超期终态搬进 *_archive；慢通道 24h 一次（多 pod 各跑各的，分片幂等收敛）
+    if (Date.now() - lastArchiveAt > ARCHIVE_INTERVAL_MS) {
+      lastArchiveAt = Date.now();
+      try {
+        const summary = await runArchiveOnce();
+        const total = summary.reduce((acc, s) => acc + s.moved, 0);
+        if (total > 0) {
+          logger.info({ summary }, "archived terminal rows");
+        }
+      } catch (error) {
+        logger.warn({ err: (error as Error).message }, "archive run failed");
+      }
+    }
   } catch (error) {
     logger.warn({ err: (error as Error).message }, "heartbeat failed");
   }
@@ -93,6 +108,10 @@ async function heartbeat(): Promise<void> {
 /** 自愈节流：慢通道 60s 一次。 */
 const HEAL_INTERVAL_MS = 60_000;
 let lastHealAt = 0;
+
+/** 归档节流：慢通道 24h 一次。 */
+const ARCHIVE_INTERVAL_MS = 24 * 3600 * 1000;
+let lastArchiveAt = 0;
 
 /** 输出 outbox 待投递水位（中继通道内刷新）：pending=待投+在途，failed=等重试，dead=需手工 redrive。 */
 const knownOutboxTenants = new Set<string>();

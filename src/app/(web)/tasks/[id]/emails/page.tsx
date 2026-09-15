@@ -69,6 +69,7 @@ export default function TaskEmailsPage() {
       </Link>
 
       <h1 className="mt-2 mb-4 text-[22px] leading-tight font-semibold text-text">邮件投递记录</h1>
+      <p className="mb-3 text-[12px] text-text-muted">仅展示近 90 天记录，更早的已归档。</p>
 
       {error && (
         <div

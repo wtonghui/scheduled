@@ -63,6 +63,9 @@ const EnvSchema = z.object({
   RELAY_BREAKER_COOLDOWN_MS: z.coerce.number().int().min(5000).max(600000).default(60000),
   // 同 host 最大并行：防单个慢下游占满全局池
   RELAY_PER_HOST_LIMIT: z.coerce.number().int().min(1).max(16).default(2),
+  // retention：终态行保留天数（超期搬进 *_archive；pending/failed/in_progress/dead 永不搬）。
+  // 改小前重估幂等键窗口（重复认领只在秒级，90 天物理不可达才安全）；钳 ≥7 防误配清空
+  RETENTION_DAYS: z.coerce.number().int().min(7).max(3650).default(90),
   // 附件内联上限（字节）：relay 下载后直接贴进邮件；超限只嵌链接不下载；0=纯链接模式。
   // base64 膨胀约 37%：2MB 附件≈2.7MB 邮件，SES/postfix 10MB 上限下安全；硬顶 10MB。
   ATTACHMENT_INLINE_MAX_BYTES: z.coerce

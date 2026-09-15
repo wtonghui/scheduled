@@ -225,8 +225,8 @@ describe("worker execution", () => {
     expect(row?.nextRunAt?.getTime() ?? 0).toBeGreaterThan(task.nextRunAt?.getTime() ?? 0);
   });
 
-  it("claim is idempotent without SKIP LOCKED (portable fallback for MySQL <8/ MariaDB <10.6)", async () => {
-    // 强制走可移植路径（无 FOR UPDATE SKIP LOCKED，靠条件 UPDATE + affectedRows 判归属）
+  it("claim stays single-path: second worker never steals (unified conditional claim)", async () => {
+    // 单一路经条件认领（SKIP LOCKED 双路径已删）；第 4 参数保留兼容，传 false 同样走统一路径
     const task = await createTestTask(tenantId, {
       nextRunAt: new Date(Date.now() - 5_000),
     });
@@ -240,6 +240,47 @@ describe("worker execution", () => {
     expect(row?.claimedBy).toBe("worker-b");
     expect(row?.claimedUntil).not.toBeNull();
     expect(row?.nextRunAt?.getTime() ?? 0).toBeGreaterThan(task.nextRunAt?.getTime() ?? 0);
+  });
+
+  it("concurrent claims from two workers win the same tick exactly once", async () => {
+    const task = await createTestTask(tenantId, {
+      nextRunAt: new Date(Date.now() - 5_000),
+    });
+    const [a, b] = await Promise.all([
+      claimDueTasks("worker-x", 60, 10),
+      claimDueTasks("worker-y", 60, 10),
+    ]);
+    const hits =
+      a.filter((c) => c.task.id === task.id).length +
+      b.filter((c) => c.task.id === task.id).length;
+    expect(hits).toBe(1); // 同一 tick 只出一行领取，输家走 settle 跳过
+    const row = await prisma.task.findUnique({ where: { id: task.id } });
+    expect(["worker-x", "worker-y"]).toContain(row?.claimedBy);
+  });
+
+  it("maxRuns quota disables the task instead of over-running (predicate in claim SQL)", async () => {
+    const task = await createTestTask(tenantId, {
+      nextRunAt: new Date(Date.now() - 5_000),
+    });
+    await prisma.task.update({ where: { id: task.id }, data: { maxRuns: 1 } });
+    // 已消耗 1 次（配额用尽；计数列是唯一依据，执行行仅作真实感）
+    await prisma.taskExecution.create({
+      data: {
+        taskId: task.id,
+        idempotencyKey: `${task.id}:quota:a1`,
+        scheduledAt: new Date(Date.now() - 3_600_000),
+        attempt: 1,
+        trigger: "scheduled",
+        status: "succeeded",
+        finishedAt: new Date(Date.now() - 3_600_000),
+      },
+    });
+    await prisma.task.update({ where: { id: task.id }, data: { consumedRuns: 1 } });
+    const items = await claimDueTasks("worker-q", 60, 10);
+    expect(items.some((c) => c.task.id === task.id)).toBe(false);
+    const row = await prisma.task.findUnique({ where: { id: task.id } });
+    expect(row?.enabled).toBe(false);
+    expect(row?.nextRunAt).toBeNull();
   });
 
   it("restart catch-up advances missed runs without executing them", async () => {

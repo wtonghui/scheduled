@@ -162,7 +162,15 @@ const RELAY_CONCURRENCY = config.RELAY_EMAIL_CONCURRENCY;
  */
 async function pickEmailBatch(limit: number, staleBefore: Date, now: Date) {
   const stale = await prisma.emailLog.findMany({
-    where: { status: "in_progress", updatedAt: { lt: staleBefore } },
+    where: {
+      status: "in_progress",
+      OR: [
+        // 显式 deadline（认领时写入 = Redis TTL 语义）：只看它
+        { nextRetryAt: { lte: now } },
+        // 发版前遗留行（无 deadline）：updatedAt 回退一个窗口，之后自然排空
+        { nextRetryAt: null, updatedAt: { lt: staleBefore } },
+      ],
+    },
     orderBy: { id: "asc" },
     take: limit,
   });
@@ -234,10 +242,20 @@ export async function runEmailRelayOnce(limit = config.RELAY_BATCH_SIZE): Promis
             OR: [
               { status: "pending" },
               { status: "failed", nextRetryAt: { lte: new Date() } },
-              { status: "in_progress", updatedAt: { lt: staleBefore } },
+              {
+                status: "in_progress",
+                OR: [
+                  { nextRetryAt: { lte: new Date() } },
+                  { nextRetryAt: null, updatedAt: { lt: staleBefore } },
+                ],
+              },
             ],
           },
-          data: { status: "in_progress" },
+          // 显式认领 deadline（= Redis TTL 语义）：回收只看它，不看 updatedAt
+          data: {
+            status: "in_progress",
+            nextRetryAt: new Date(Date.now() + STALE_IN_PROGRESS_MS),
+          },
         });
         if (claimed.count === 0) {
           return;

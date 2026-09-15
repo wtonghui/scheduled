@@ -66,7 +66,7 @@ async function createExecution(
   systemUserId?: string | null,
 ) {
   try {
-    return await prisma.taskExecution.create({
+    const created = await prisma.taskExecution.create({
       data: {
         taskId,
         idempotencyKey,
@@ -77,6 +77,16 @@ async function createExecution(
         ...(systemUserId ? { systemUserId } : {}),
       },
     });
+    // 配额计数（retention 设计）：attempt=1 的 scheduled 创建即占配额（manual 永不占；
+    // queued 走 claim 排队分支另计）。只在真实创建时 +1，P2002 复用不加。
+    // 单语句原子增，多 pod 不丢数；归档搬运动它（计数含已归档，配额永不复活）。
+    if (attempt === 1 && trigger === "scheduled") {
+      await prisma.task.update({
+        where: { id: taskId },
+        data: { consumedRuns: { increment: 1 } },
+      });
+    }
+    return created;
   } catch (error) {
     // 并发重复领取 → 幂等复用既有行
     if ((error as { code?: string }).code === "P2002") {

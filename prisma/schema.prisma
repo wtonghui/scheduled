@@ -57,6 +57,7 @@ model Task {
   overlapPolicy           String          @default("skip") @map("overlap_policy") @db.VarChar(16) // 上次未结束时：skip 跳过 / queue 排队 / run 允许并行
   endsAt                  DateTime?       @map("ends_at") @db.DateTime(6) // 重复调度的截止时刻；与 maxRuns 可共存（谁先到谁停）
   maxRuns                 Int?            @map("max_runs") // 重复调度的总次数上限（调度触发计，run-now/重试/跳过不计）
+  consumedRuns            Int             @default(0) @map("consumed_runs") // 已消耗配额（归档不碰它，配额永不复活）
   taskType                TaskType        @default(http) @map("task_type")
   payload                 Json
   payloadSecrets          Bytes?          @map("payload_secrets") // AES-256-GCM 密文（含 nonce）
@@ -85,6 +86,7 @@ model Task {
   executions              TaskExecution[]
 
   @@index([nextRunAt, enabled])
+  @@index([enabled, nextRunAt, claimedUntil]) // 认领读覆盖（任务 2）
   @@index([claimedUntil])
   @@index([tenantId, nextRunAt])
   @@index([tenantId, enabled])

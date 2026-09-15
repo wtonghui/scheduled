@@ -608,8 +608,14 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
 }
 
 export async function remove(tenantId: string, id: string): Promise<void> {
-  // 硬删除（v1）：同一事务内先清 outbox/执行，避免 FK（run_id→execution、task_id）冲突
+  // 硬删除（v1）：同一事务内先清 outbox/执行，避免 FK（run_id→execution、task_id）冲突；
+  // 归档表无 FK，顺手按 taskId 清掉（webhook 归档有 taskId 列，无需 join）。
   const result = await prisma.$transaction(async (tx) => {
+    // 归属前置：跨租户直接 404，避免先删后判误删数据
+    const owned = await tx.task.findFirst({ where: { id, tenantId }, select: { id: true } });
+    if (!owned) {
+      throw new AppError(404, "NOT_FOUND", "task not found");
+    }
     const executions = await tx.taskExecution.findMany({
       where: { taskId: id },
       select: { id: true },
@@ -617,6 +623,9 @@ export async function remove(tenantId: string, id: string): Promise<void> {
     // 先清 outbox（FK: run_id → execution），再删 task（onDelete: Cascade 级联 executions）
     await tx.emailLog.deleteMany({ where: { runId: { in: executions.map((e) => e.id) } } });
     await tx.webhookDelivery.deleteMany({ where: { runId: { in: executions.map((e) => e.id) } } });
+    await tx.$executeRawUnsafe(`DELETE FROM email_log_archive WHERE task_id = ?`, id);
+    await tx.$executeRawUnsafe(`DELETE FROM webhook_delivery_archive WHERE task_id = ?`, id);
+    await tx.$executeRawUnsafe(`DELETE FROM task_execution_archive WHERE task_id = ?`, id);
     return tx.task.deleteMany({ where: { id, tenantId } });
   });
   if (result.count === 0) {

@@ -284,6 +284,7 @@ export default function TaskDetailPage() {
       </Card>
 
       <h2 className="mb-2.5 text-[15px] font-semibold text-text">执行记录</h2>
+      <p className="mb-2 text-[12px] text-text-muted">仅展示近 90 天记录，更早的已归档。</p>
       <Card className="overflow-hidden p-0">
         {executions.length === 0 ? (
           <EmptyState

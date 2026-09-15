@@ -2,15 +2,16 @@ import { Prisma } from "@prisma/client";
 import { createPool } from "../src/lib/concurrency";
 import { computeNextRun } from "../src/lib/cron";
 import { prisma } from "../src/lib/db";
-import { adjustForHolidays, type HolidayPolicy } from "../src/lib/holiday";
+import { type HolidayPolicy, adjustForHolidays } from "../src/lib/holiday";
 import { logger } from "../src/lib/logger";
+import { taskClaimDurationMs } from "../src/lib/metrics";
 import type { RunTaskDefinition } from "../src/modules/execution/service";
 
 /**
  * 调度器（research.md §2 / FR-005/FR-014/FR-012）：
- * - 到期任务领取：单事务内 `SELECT ... FOR UPDATE SKIP LOCKED`（服务器支持时）+ 租约 + 推进 next_run_at。
- * - 低版本兼容：MySQL < 8.0.1 / MariaDB < 10.6 不支持 SKIP LOCKED，自动退化为
- *   「条件 UPDATE + 受影响行数」的可移植领取（与 outbox 领取同一模式），多实例判定等价。
+ * - 到期任务领取（三段式）：READ（无事务候选+计数+推进计算）→ WRITE（单短事务条件认领）
+ *   → SETTLE（失败重读定夺）。归属唯一靠写谓词（tick 等值/maxRuns/endsAt/租约），
+ *   单语句原子，任意 MySQL/MariaDB 版本、多 pod 同一语义。
  * - 手动运行（run-now）领取：status='pending' AND trigger='manual' 的执行行。
  * - 重启对账 + 租约回收（T038）。
  */
@@ -29,6 +30,7 @@ interface DueRow {
   overlapPolicy: string;
   endsAt: Date | null;
   maxRuns: number | bigint | null;
+  consumedRuns: number | bigint;
   skipHolidays: boolean;
   holidayPolicy: string;
   taskType: string;
@@ -48,6 +50,7 @@ interface DueRow {
   emailBodyTemplate: string | null;
   emailAttachmentUrlTemplate: string | null;
   execSignSecret: Uint8Array | string | null;
+  systemUserId: string | null;
 }
 
 function parseJsonColumn(value: unknown, fallback: unknown = {}): unknown {
@@ -90,12 +93,14 @@ function toTaskDefinition(row: DueRow): RunTaskDefinition {
     emailBodyTemplate: row.emailBodyTemplate,
     emailAttachmentUrlTemplate: row.emailAttachmentUrlTemplate,
     execSignSecret: toBytes(row.execSignSecret),
+    systemUserId: row.systemUserId ?? null,
   };
 }
 
 const TASK_COLUMNS = Prisma.sql`
   id, cron, schedule_interval_seconds AS scheduleIntervalSeconds,
   timezone, overlap_policy AS overlapPolicy, ends_at AS endsAt, max_runs AS maxRuns,
+  consumed_runs AS consumedRuns,
   skip_holidays AS skipHolidays, holiday_policy AS holidayPolicy,
   task_type AS taskType, timeout_ms AS timeoutMs, max_attempts AS maxAttempts,
   retry_delay_ms AS retryDelayMs,
@@ -105,34 +110,8 @@ const TASK_COLUMNS = Prisma.sql`
   email_subject_template AS emailSubjectTemplate,
   email_body_template AS emailBodyTemplate,
   email_attachment_url_template AS emailAttachmentUrlTemplate,
-  exec_sign_secret AS execSignSecret
+  exec_sign_secret AS execSignSecret, system_user_id AS systemUserId
 `;
-
-/** 已消耗的调度次数：attempt=1 且 trigger 为调度触发的行；run-now/重试行/跳过行不计（D3/D4）。
- * 用 Prisma 类型化 groupBy（非 raw SQL）规避 MySQL `trigger` 保留字反引号问题。 */
-async function countScheduledRuns(
-  tx: Parameters<Parameters<(typeof prisma)["$transaction"]>[0]>[0],
-  taskIds: string[],
-): Promise<Map<string, number>> {
-  const used = new Map<string, number>();
-  if (taskIds.length === 0) {
-    return used;
-  }
-  const counts = await tx.taskExecution.groupBy({
-    by: ["taskId"],
-    where: {
-      taskId: { in: taskIds },
-      attempt: 1,
-      trigger: { in: ["scheduled", "queued"] },
-      status: { not: "skipped" },
-    },
-    _count: { taskId: true },
-  });
-  for (const c of counts) {
-    used.set(c.taskId, c._count.taskId);
-  }
-  return used;
-}
 
 /** 假日调整（skipHolidays=false 直接返回原值，零开销；失败 fail-open 在 holiday 模块内）。 */
 async function applyTaskHolidays(
@@ -161,42 +140,8 @@ async function applyTaskHolidays(
  * 防「创建→转 running」微秒窗口被并发实例顺手偷走。 */
 const PENDING_RECLAIM_GRACE_SECONDS = 5;
 
-/** SKIP LOCKED 能力探测结果缓存（进程内仅探测一次）。 */
-let skipLockedSupportedCache: boolean | null = null;
-
-/**
- * 服务器是否支持 `SELECT ... FOR UPDATE SKIP LOCKED`：
- * MySQL ≥ 8.0.1 或 MariaDB ≥ 10.6 支持。探测失败时保守按"不支持"处理（可移植路径不影响正确性）。
- */
-async function supportsSkipLocked(): Promise<boolean> {
-  if (skipLockedSupportedCache !== null) {
-    return skipLockedSupportedCache;
-  }
-  try {
-    const rows = (await prisma.$queryRaw(Prisma.sql`SELECT VERSION() AS version`)) as Array<{
-      version: string;
-    }>;
-    const version = rows[0]?.version ?? "";
-    const isMaria = /mariadb/i.test(version);
-    const [, majStr = "0", minStr = "0"] = /^(\d+)\.(\d+)/.exec(version) ?? [];
-    const major = Number(majStr);
-    const minor = Number(minStr);
-    const supported = isMaria
-      ? major > 10 || (major === 10 && minor >= 6)
-      : major > 8 || (major === 8 && minor >= 1);
-    skipLockedSupportedCache = supported;
-    logger.info({ version, skipLocked: supported }, "claim: sql capability probe");
-    return supported;
-  } catch (error) {
-    logger.warn({ err: error }, "claim: SKIP LOCKED probe failed; using portable claim sql");
-    skipLockedSupportedCache = false;
-    return false;
-  }
-}
-
-/** 到期任务候选查询：支持 SKIP LOCKED 时加锁跳过，否则不带（归属交由条件 UPDATE 判定）。 */
-function dueTasksSelectSql(batchSize: number, skipLocked: boolean): Prisma.Sql {
-  const tail = skipLocked ? Prisma.sql`FOR UPDATE SKIP LOCKED` : Prisma.sql``;
+/** 到期任务候选查询（无锁 plain SELECT；归属由写阶段条件 UPDATE 裁决，见 claimDueItems）。 */
+function dueTasksSelectSql(batchSize: number): Prisma.Sql {
   return Prisma.sql`
     SELECT ${TASK_COLUMNS}
     FROM task
@@ -204,7 +149,18 @@ function dueTasksSelectSql(batchSize: number, skipLocked: boolean): Prisma.Sql {
       AND (claimed_until IS NULL OR claimed_until < NOW())
     ORDER BY next_run_at ASC
     LIMIT ${batchSize}
-    ${tail}
+  `;
+}
+
+/** 被租约挡住的到期任务（上次仍在跑）：到期但租约有效，走 overlapPolicy 分支。 */
+function blockedTasksSelectSql(batchSize: number): Prisma.Sql {
+  return Prisma.sql`
+    SELECT ${TASK_COLUMNS}
+    FROM task
+    WHERE enabled = 1 AND next_run_at <= NOW()
+      AND claimed_until IS NOT NULL AND claimed_until > NOW()
+    ORDER BY next_run_at ASC
+    LIMIT ${batchSize}
   `;
 }
 
@@ -212,11 +168,7 @@ function dueTasksSelectSql(batchSize: number, skipLocked: boolean): Prisma.Sql {
  * 调度触发行加「created_at 早于宽限期」门槛：正常 worker 创建→立即转 running（微秒级），
  * 只有创建者已死的陈旧 pending 才被补跑；手动/排队触发故意等待领取，不受宽限。
  * 用 $queryRawUnsafe + 反引号规避 MySQL `trigger` 保留字（Prisma.sql 模板内无法含反引号）。 */
-function pendingExecutionsSelectSql(
-  batchSize: number,
-  skipLocked: boolean,
-): { sql: string; params: number[] } {
-  const tail = skipLocked ? "FOR UPDATE SKIP LOCKED" : "";
+function pendingExecutionsSelectSql(batchSize: number): { sql: string; params: number[] } {
   return {
     sql: `SELECT te.id, te.scheduled_at AS scheduledAt, te.task_id AS taskId, te.\`trigger\` AS \`trigger\`
       FROM task_execution te
@@ -224,235 +176,343 @@ function pendingExecutionsSelectSql(
         AND (te.\`trigger\` IN ('manual', 'queued')
               OR te.created_at < DATE_SUB(NOW(), INTERVAL ? SECOND))
       ORDER BY te.created_at ASC
-      LIMIT ? ${tail}`,
+      LIMIT ?`,
     params: [PENDING_RECLAIM_GRACE_SECONDS, batchSize],
   };
 }
 
+interface DuePlan {
+  row: DueRow;
+  tick: Date;
+  advanceTo: Date | null;
+  action: "claim" | "disable";
+}
+
 /**
- * 领取到期任务 + 手动执行（单事务）。
- * 服务器支持时用 `FOR UPDATE SKIP LOCKED`；低版本 MySQL/MariaDB 自动退化为
- * 「条件 UPDATE + 受影响行数」判定归属（并发下抢不到的候选行直接跳过，多实例仍恰好一次）。
- * @param skipLockedOverride 测试用：强制走/不走 SKIP LOCKED 路径；缺省探测服务器版本。
+ * 推进计算（READ 阶段，无事务）：配额读 consumedRuns 列（建议性预检，省掉无用 holiday 调用），
+ * 写阶段谓词裁决。先假日调整再判结束规则（被顺延/跳过的 tick 不占配额，超 endsAt 才停）。
+ */
+async function planDueRow(row: DueRow, now: Date): Promise<DuePlan> {
+  const tick = new Date(row.nextRunAt);
+  // maxRuns 计已执行次数：用尽则本轮不跑（跑了就超配额）
+  if (row.maxRuns != null && Number(row.consumedRuns ?? 0) >= Number(row.maxRuns)) {
+    return { row, tick, advanceTo: null, action: "disable" };
+  }
+  // endsAt 按本轮 tick 判定（tick 在窗口内就执行；重算的下次超窗只影响推进）
+  if (row.endsAt && tick.getTime() > row.endsAt.getTime()) {
+    return { row, tick, advanceTo: null, action: "disable" };
+  }
+  const rawNext = computeNextRun(
+    { cron: row.cron, scheduleIntervalSeconds: row.scheduleIntervalSeconds },
+    now,
+    row.timezone,
+  );
+  // 注意 next==null 不拦执行：到期的一次性任务（runAt）无下次但本轮欠一次，
+  // 走原领取路径执行一次并停用（既有语义）
+  const next = await applyTaskHolidays(rawNext, row);
+  const advanceTo = next && row.endsAt && next.getTime() > row.endsAt.getTime() ? null : next;
+  return { row, tick, advanceTo, action: "claim" };
+}
+
+/**
+ * 到期认领 UPDATE（方案 C 谓词 + retention 计数列）：tick 等值 guard 防过期覆盖；
+ * endsAt 谓词 + consumedRuns 列比较进语句（单语句原子，配额永不超发，归档不影响）；
+ * claimed_until 谓词保恰好一次。
+ * tick 精度假设：next_run_at 全经 JS Date 写入（毫秒精度），DB 往返无损，等值安全。
+ */
+function claimDueSql(plan: DuePlan, workerId: string, leaseSeconds: number): Prisma.Sql {
+  const { row, tick, advanceTo } = plan;
+  return Prisma.sql`
+    UPDATE task
+    SET claimed_by = ${workerId},
+        claimed_until = DATE_ADD(NOW(), INTERVAL ${leaseSeconds} SECOND),
+        next_run_at = ${advanceTo},
+        enabled = ${advanceTo ? 1 : 0}
+    WHERE id = ${row.id}
+      AND next_run_at = ${tick}
+      AND (claimed_until IS NULL OR claimed_until < NOW())
+      AND (ends_at IS NULL OR ${tick} <= ends_at)
+      AND (max_runs IS NULL OR consumed_runs < max_runs)
+  `;
+}
+
+/**
+ * 认领失败定夺（SETTLE 阶段，事务外，只走失败路径）：重读区分被抢先（tick 已变→不管）、
+ * 配额用尽/超窗（条件停用，tick guard 防覆盖）。误判最多多打日志，不影响正确性。
+ */
+async function settleFailedClaim(plan: DuePlan): Promise<void> {
+  const { row, tick } = plan;
+  const fresh = await prisma.task.findUnique({
+    where: { id: row.id },
+    select: { nextRunAt: true, maxRuns: true, consumedRuns: true, endsAt: true },
+  });
+  if (!fresh?.nextRunAt || fresh.nextRunAt.getTime() !== tick.getTime()) {
+    return; // 被别实例推进/停用/删除：不管
+  }
+  if (fresh.maxRuns != null) {
+    if (Number(fresh.consumedRuns ?? 0) >= Number(fresh.maxRuns)) {
+      await prisma.task.updateMany({
+        where: { id: row.id, nextRunAt: tick },
+        data: { nextRunAt: null, enabled: false },
+      });
+      return;
+    }
+  }
+  if (fresh.endsAt && tick.getTime() > fresh.endsAt.getTime()) {
+    await prisma.task.updateMany({
+      where: { id: row.id, nextRunAt: tick },
+      data: { nextRunAt: null, enabled: false },
+    });
+  }
+  // 租约竞输：下轮再领
+}
+
+/**
+ * 领取到期任务 + 手动执行（三段式，任务 1 拆事务后）：
+ * READ（无事务：候选 SELECT + 计数 + next/假日计算）→ WRITE（单短事务：只 UPDATE/INSERT）
+ * → SETTLE（事务外：认领失败重读定夺停用/跳过）。
+ * 正确性不靠事务/行锁，靠写谓词（方案 C）：tick 等值 guard 防过期覆盖；
+ * maxRuns/endsAt 谓词进认领 UPDATE（单语句原子），配额永不超发；
+ * queued 领取带 NOT EXISTS 租约谓词。多 pod/任意 DB 版本同一语义（SKIP LOCKED 已删）。
+ * @param _skipLockedOverride 已废弃：保留签名免改调用方，无视此参数。
  */
 export async function claimDueItems(
   workerId: string,
   leaseSeconds: number,
   batchSize: number,
-  skipLockedOverride?: boolean,
+  _skipLockedOverride?: boolean,
 ): Promise<ClaimItem[]> {
-  const skipLocked = skipLockedOverride ?? (await supportsSkipLocked());
-  const items = await prisma.$transaction(async (tx) => {
-    const items: ClaimItem[] = [];
+  const started = Date.now();
+  const now = new Date();
 
+  // ── READ ──
+  const due = (await prisma.$queryRaw(dueTasksSelectSql(batchSize))) as DueRow[];
+  const blocked = (await prisma.$queryRaw(blockedTasksSelectSql(batchSize))) as DueRow[];
+  // 假日计算并行（并发 8 写死；isHoliday 自带 24h 缓存+同 tick 去重，同天同 zone 基本 1 次 API）
+  const holidayPool = createPool(8);
+  const plans = await Promise.all(
+    due.map((row) => holidayPool.run(() => planDueRow(row, now))),
+  );
+  const blockedPlans = await Promise.all(
+    blocked.map((row) => holidayPool.run(() => planDueRow(row, now))),
+  );
+  const pendingQuery = pendingExecutionsSelectSql(batchSize);
+  const manual = (await prisma.$queryRawUnsafe(pendingQuery.sql, ...pendingQuery.params)) as Array<{
+    id: string;
+    scheduledAt: Date;
+    taskId: string;
+    trigger: string;
+  }>;
+  const byId = new Map<string, DueRow>();
+  if (manual.length > 0) {
+    const taskRows = (await prisma.$queryRaw(
+      Prisma.sql`
+        SELECT ${TASK_COLUMNS}
+        FROM task
+        WHERE id IN (${Prisma.join(manual.map((m) => m.taskId))})
+      `,
+    )) as DueRow[];
+    for (const row of taskRows) {
+      byId.set(row.id, row);
+    }
+  }
+  // queued 租约初筛（建议；裁决在写阶段 NOT EXISTS 谓词）
+  const leaseUntil = new Map<string, number | null>();
+  const queuedTaskIds = [
+    ...new Set(manual.filter((m) => m.trigger === "queued").map((m) => m.taskId)),
+  ];
+  if (queuedTaskIds.length > 0) {
+    const leases = (await prisma.$queryRaw(
+      Prisma.sql`SELECT id, claimed_until AS claimedUntil FROM task WHERE id IN (${Prisma.join(queuedTaskIds)})`,
+    )) as Array<{ id: string; claimedUntil: Date | null }>;
+    for (const l of leases) {
+      leaseUntil.set(l.id, l.claimedUntil ? l.claimedUntil.getTime() : null);
+    }
+  }
+  const readMs = Date.now() - started;
+
+  // ── WRITE（单短事务）──
+  const items: ClaimItem[] = [];
+  const failures: DuePlan[] = [];
+  // due/blocked 同 tick 去重（读分两次，租约恰好过期会两边都出现；先到先得，输家走 settle）
+  const handled = new Set<string>();
+  const writeStarted = Date.now();
+  await prisma.$transaction(async (tx) => {
     // 1) 到期任务
-    const due = (await tx.$queryRaw(dueTasksSelectSql(batchSize, skipLocked))) as DueRow[];
-    const usedMap = await countScheduledRuns(
-      tx,
-      due.map((row) => row.id),
-    );
-
-    for (const row of due) {
-      const rawNext = computeNextRun(
-        { cron: row.cron, scheduleIntervalSeconds: row.scheduleIntervalSeconds },
-        new Date(),
-        row.timezone,
-      );
-      // 先假日调整再判结束规则（被顺延/跳过的 tick 不占配额，超 endsAt 才停）
-      const next = await applyTaskHolidays(rawNext, row);
-      const tick = new Date(row.nextRunAt);
-      // maxRuns 计已执行次数：用尽则本轮不跑（跑了就超配额）。
-      if (row.maxRuns != null && (usedMap.get(row.id) ?? 0) >= Number(row.maxRuns)) {
+    for (const plan of plans) {
+      if (handled.has(plan.row.id)) {
+        continue;
+      }
+      handled.add(plan.row.id);
+      if (plan.action === "disable") {
         await tx.$executeRaw(
-          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id}`,
+          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${plan.row.id} AND next_run_at = ${plan.tick}`,
         );
         continue;
       }
-      // endsAt 按本轮 tick 判定（tick 在窗口内就执行；重算的下次超窗只影响推进）。
-      // 注意 next==null 不拦执行：到期的一次性任务（runAt）无下次但本轮欠一次，
-      // 走原领取路径执行一次并停用（既有语义）。
-      if (row.endsAt && tick.getTime() > row.endsAt.getTime()) {
-        await tx.$executeRaw(
-          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id}`,
-        );
-        continue;
-      }
-      const advanceTo = next && row.endsAt && next.getTime() > row.endsAt.getTime() ? null : next;
-      // 归属判定：SKIP LOCKED 下持有行锁必命中；兼容路径下若已被别实例抢先，affectedRows=0 → 跳过。
-      const claimed = await tx.$executeRaw(
-        Prisma.sql`
-          UPDATE task
-          SET claimed_by = ${workerId},
-              claimed_until = DATE_ADD(NOW(), INTERVAL ${leaseSeconds} SECOND),
-              next_run_at = ${advanceTo},
-              enabled = ${advanceTo ? 1 : 0}
-          WHERE id = ${row.id}
-            AND (claimed_until IS NULL OR claimed_until < NOW())
-        `,
-      );
+      // 归属判定：谓词全中才命中；被别实例抢先则 affectedRows=0 → settle 定夺
+      const claimed = await tx.$executeRaw(claimDueSql(plan, workerId, leaseSeconds));
       if (claimed === 0) {
+        failures.push(plan);
         continue;
       }
       items.push({
         kind: "scheduled",
-        task: toTaskDefinition(row),
-        scheduledAt: new Date(row.nextRunAt),
+        task: toTaskDefinition(plan.row),
+        scheduledAt: plan.tick,
       });
     }
 
-    // 2) 被租约挡住的到期任务（上次仍在跑）：到期但租约有效，正常路径领不到，
-    // 按 overlapPolicy 处理。next 推进后本 tick 不再到期，同 tick 最多留一行审计/排队。
-    const blocked = (await tx.$queryRaw(
-      Prisma.sql`
-        SELECT ${TASK_COLUMNS}, system_user_id AS systemUserId
-        FROM task
-        WHERE enabled = 1 AND next_run_at <= NOW()
-          AND claimed_until IS NOT NULL AND claimed_until > NOW()
-        ORDER BY next_run_at ASC
-        LIMIT ${batchSize}
-        ${skipLocked ? Prisma.sql`FOR UPDATE SKIP LOCKED` : Prisma.sql``}
-      `,
-    )) as Array<DueRow & { systemUserId: string | null; nextRunAt: Date }>;
-    if (blocked.length > 0) {
-      const blockedUsed = await countScheduledRuns(
-        tx,
-        blocked.map((row) => row.id),
+    // 2) 被租约挡住的到期任务（上次仍在跑）：按 overlapPolicy 处理
+    for (const plan of blockedPlans) {
+      const { row, tick, advanceTo } = plan;
+      if (handled.has(row.id)) {
+        continue; // due 侧已处理同 tick（读分两次的交错窗口）
+      }
+      handled.add(row.id);
+      if (plan.action === "disable") {
+        await tx.$executeRaw(
+          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id} AND next_run_at = ${tick}`,
+        );
+        continue;
+      }
+      if (row.overlapPolicy === "run") {
+        // 显式允许并行：无视租约强领（用户自担双跑风险），但仍要 tick guard 防覆盖别人的推进
+        const claimed = await tx.$executeRaw(
+          Prisma.sql`
+            UPDATE task
+            SET claimed_by = ${workerId},
+                claimed_until = DATE_ADD(NOW(), INTERVAL ${leaseSeconds} SECOND),
+                next_run_at = ${advanceTo},
+                enabled = ${advanceTo ? 1 : 0}
+            WHERE id = ${row.id} AND next_run_at = ${tick}
+          `,
+        );
+        if (claimed === 0) {
+          continue;
+        }
+        items.push({
+          kind: "scheduled",
+          task: toTaskDefinition(row),
+          scheduledAt: tick,
+        });
+        continue;
+      }
+      // 推进时刻（tick guard 防并发复写），再按策略留痕；超窗则推进到 null 并停用
+      const advanced = await tx.$executeRaw(
+        Prisma.sql`UPDATE task SET next_run_at = ${advanceTo}, enabled = ${advanceTo ? 1 : 0}
+          WHERE id = ${row.id} AND next_run_at = ${tick} AND next_run_at <= NOW()`,
       );
-      for (const row of blocked) {
-        const tick = new Date(row.nextRunAt);
-        const rawNext = computeNextRun(
-          { cron: row.cron, scheduleIntervalSeconds: row.scheduleIntervalSeconds },
-          new Date(),
-          row.timezone,
-        );
-        const next = await applyTaskHolidays(rawNext, row);
-        // maxRuns 用尽 → 不留痕停用；endsAt 按本轮 tick 判定（窗口内才处理）。
-        if (row.maxRuns != null && (blockedUsed.get(row.id) ?? 0) >= Number(row.maxRuns)) {
-          await tx.$executeRaw(
-            Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id}`,
-          );
-          continue;
+      if (advanced === 0) {
+        continue;
+      }
+      const kind = row.overlapPolicy === "queue" ? "queued" : "skipped";
+      const status = row.overlapPolicy === "queue" ? "pending" : "skipped";
+      // 排队合并（A1 keep-newest）：新 tick 到达前把该任务更早的未领排队行翻成 skipped，
+      // 每任务至多 1 行 pending 排队——防上游卡死时积压 N 行、释放后连跑 N 次过期数据并误烧 maxRuns。
+      // 单语句原子，多 pod 幂等（第二个翻不到东西）；running 行不碰（够不着 pending），该跑的照跑。
+      // skipped 不计配额（翻转时已扣回 consumedRuns），故一次突发只占 1 次配额。
+      if (kind === "queued") {
+        const superseded = await tx.taskExecution.updateMany({
+          where: {
+            taskId: row.id,
+            trigger: "queued",
+            status: "pending",
+            scheduledAt: { lt: tick },
+          },
+          data: { status: "skipped" },
+        });
+        // 合并扣配额：被翻成 skipped 的旧排队不再占配额（skipped 不计数），按实际翻转数扣回
+        if (superseded.count > 0) {
+          await tx.task.update({
+            where: { id: row.id },
+            data: { consumedRuns: { decrement: superseded.count } },
+          });
         }
-        if (row.endsAt && tick.getTime() > row.endsAt.getTime()) {
-          await tx.$executeRaw(
-            Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id}`,
-          );
-          continue;
-        }
-        const advanceTo = next && row.endsAt && next.getTime() > row.endsAt.getTime() ? null : next;
-        if (row.overlapPolicy === "run") {
-          // 显式允许并行：无视租约强领（用户自担双跑风险）
-          const claimed = await tx.$executeRaw(
-            Prisma.sql`
-              UPDATE task
-              SET claimed_by = ${workerId},
-                  claimed_until = DATE_ADD(NOW(), INTERVAL ${leaseSeconds} SECOND),
-                  next_run_at = ${advanceTo},
-                  enabled = ${advanceTo ? 1 : 0}
-              WHERE id = ${row.id}
-            `,
-          );
-          if (claimed === 0) {
-            continue;
-          }
-          items.push({
-            kind: "scheduled",
-            task: toTaskDefinition(row),
+      }
+      try {
+        // 类型化写入（列名 trigger 为保留字，raw 需反引号——模板内反引号与定界符冲突，故走 typed）
+        await tx.taskExecution.create({
+          data: {
+            taskId: row.id,
+            idempotencyKey: `${row.id}:${tick.toISOString()}:${kind}`,
             scheduledAt: tick,
+            attempt: 1,
+            trigger: kind,
+            status: status as "pending" | "skipped",
+            systemUserId: row.systemUserId,
+          },
+        });
+        // 配额计数：queued 排队行创建即占配额（skipped 审计行不占）；只在真实创建时 +1，P2002 不加
+        if (kind === "queued") {
+          await tx.task.update({
+            where: { id: row.id },
+            data: { consumedRuns: { increment: 1 } },
           });
-          continue;
         }
-        // 推进时刻（条件更新防并发复写），再按策略留痕；超窗则推进到 null 并停用
-        const advanced = await tx.$executeRaw(
-          Prisma.sql`UPDATE task SET next_run_at = ${advanceTo}, enabled = ${advanceTo ? 1 : 0}
-            WHERE id = ${row.id} AND next_run_at <= NOW()`,
-        );
-        if (advanced === 0) {
-          continue;
-        }
-        const kind = row.overlapPolicy === "queue" ? "queued" : "skipped";
-        const status = row.overlapPolicy === "queue" ? "pending" : "skipped";
-        try {
-          // 类型化写入（列名 trigger 为保留字，raw 需反引号——模板内反引号与定界符冲突，故走 typed）
-          await tx.taskExecution.create({
-            data: {
-              taskId: row.id,
-              idempotencyKey: `${row.id}:${tick.toISOString()}:${kind}`,
-              scheduledAt: tick,
-              attempt: 1,
-              trigger: kind,
-              status: status as "pending" | "skipped",
-              systemUserId: row.systemUserId,
-            },
-          });
-        } catch (error) {
-          // 并发实例同 tick 双写 → 幂等键冲突，忽略（对方已留痕）
-          if ((error as { code?: string }).code !== "P2002") {
-            throw error;
-          }
+      } catch (error) {
+        // 并发实例同 tick 双写 → 幂等键冲突，忽略（对方已留痕）
+        if ((error as { code?: string }).code !== "P2002") {
+          throw error;
         }
       }
     }
 
-    // 3) 运行/补跑/排队候选：pending 执行行（run-now、排队行或符合条件的陈旧遗留行）
-    const pendingQuery = pendingExecutionsSelectSql(batchSize, skipLocked);
-    const manual = (await tx.$queryRawUnsafe(pendingQuery.sql, ...pendingQuery.params)) as Array<{
-      id: string;
-      scheduledAt: Date;
-      taskId: string;
-      trigger: string;
-    }>;
-
-    if (manual.length > 0) {
-      const taskRows = (await tx.$queryRaw(
-        Prisma.sql`
-          SELECT ${TASK_COLUMNS}
-          FROM task
-          WHERE id IN (${Prisma.join(manual.map((m) => m.taskId))})
-        `,
-      )) as DueRow[];
-      const byId = new Map(taskRows.map((row) => [row.id, row]));
-      for (const exec of manual) {
-        const row = byId.get(exec.taskId);
-        if (!row) {
+    // 3) 运行/补跑/排队候选：pending 执行行（run-now、排队行或陈旧遗留行）
+    for (const exec of manual) {
+      const row = byId.get(exec.taskId);
+      if (!row) {
+        continue;
+      }
+      if (exec.trigger === "queued") {
+        // 初筛（租约有效则等）+ 原子谓词双保险：写瞬间租约仍有效则认领失败，不抢跑
+        const until = leaseUntil.get(exec.taskId);
+        if (until != null && until > Date.now()) {
           continue;
         }
-        if (exec.trigger === "queued") {
-          // 排队行：上次仍在跑（租约有效）则继续等，不抢跑；租约释放后领取
-          const lease = (await tx.$queryRaw(
-            Prisma.sql`SELECT claimed_until AS claimedUntil FROM task WHERE id = ${exec.taskId}`,
-          )) as Array<{ claimedUntil: Date | null }>;
-          const held = lease[0]?.claimedUntil && lease[0].claimedUntil.getTime() > Date.now();
-          if (held) {
-            continue;
-          }
+        const claimed = await tx.$executeRaw(
+          Prisma.sql`UPDATE task_execution SET status = 'running'
+            WHERE id = ${exec.id} AND status = 'pending'
+            AND NOT EXISTS (SELECT 1 FROM task WHERE id = ${exec.taskId} AND claimed_until > NOW())`,
+        );
+        if (claimed === 0) {
+          continue;
         }
-        // 兼容路径下抢不到（status 已非 pending）则跳过；SKIP LOCKED 路径必命中。
+      } else {
+        // 抢不到（status 已非 pending）则跳过，多实例仍恰好一次
         const claimed = await tx.$executeRaw(
           Prisma.sql`UPDATE task_execution SET status = 'running' WHERE id = ${exec.id} AND status = 'pending'`,
         );
         if (claimed === 0) {
           continue;
         }
-        // 执行层领取同样给 task 打租约：运行=租约的证据，续租/孤儿对账统一走 task 行
-        await tx.$executeRaw(
-          Prisma.sql`
-            UPDATE task SET claimed_by = ${workerId},
-              claimed_until = DATE_ADD(NOW(), INTERVAL ${leaseSeconds} SECOND)
-            WHERE id = ${row.id}
-          `,
-        );
-        items.push({
-          kind: "manual",
-          task: toTaskDefinition(row),
-          scheduledAt: new Date(exec.scheduledAt),
-          executionId: exec.id,
-        });
       }
+      // 执行层领取同样给 task 打租约：运行=租约的证据，续租/孤儿对账统一走 task 行
+      await tx.$executeRaw(
+        Prisma.sql`
+          UPDATE task SET claimed_by = ${workerId},
+            claimed_until = DATE_ADD(NOW(), INTERVAL ${leaseSeconds} SECOND)
+          WHERE id = ${row.id}
+        `,
+      );
+      items.push({
+        kind: "manual",
+        task: toTaskDefinition(row),
+        scheduledAt: new Date(exec.scheduledAt),
+        executionId: exec.id,
+      });
     }
-
-    return items;
   });
+  const writeMs = Date.now() - writeStarted;
+
+  // ── SETTLE（事务外）：认领失败重读定夺（停用/跳过），只走失败路径
+  for (const plan of failures) {
+    await settleFailedClaim(plan);
+  }
+
+  taskClaimDurationMs.observe({ phase: "read" }, readMs);
+  taskClaimDurationMs.observe({ phase: "write" }, writeMs);
+  logger.debug({ readMs, writeMs, claimed: items.length }, "claim round finished");
   return items;
 }
 
@@ -478,6 +538,7 @@ export async function advanceMissedRuns(now = new Date()): Promise<number> {
       timezone: true,
       endsAt: true,
       maxRuns: true,
+      consumedRuns: true,
       skipHolidays: true,
       holidayPolicy: true,
     },
@@ -485,24 +546,12 @@ export async function advanceMissedRuns(now = new Date()): Promise<number> {
   if (missed.length === 0) {
     return 0;
   }
-  const counts = await prisma.taskExecution.groupBy({
-    by: ["taskId"],
-    where: {
-      taskId: { in: missed.map((t) => t.id) },
-      attempt: 1,
-      trigger: { in: ["scheduled", "queued"] },
-      status: { not: "skipped" },
-    },
-    _count: { taskId: true },
-  });
-  const usedMap = new Map(counts.map((c) => [c.taskId, c._count.taskId]));
   const pool = createPool(16);
   await Promise.all(
     missed.map((task) =>
       pool.run(async () => {
-        const used = usedMap.get(task.id) ?? 0;
-        // maxRuns 用尽 → 直接停用（配额计已执行次数，本轮不欠执行）。
-        if (task.maxRuns != null && used >= Number(task.maxRuns)) {
+        // maxRuns 用尽 → 直接停用（读 consumedRuns 列，不数全表；归档不影响）。
+        if (task.maxRuns != null && Number(task.consumedRuns ?? 0) >= Number(task.maxRuns)) {
           await prisma.task.update({
             where: { id: task.id },
             data: { nextRunAt: null, enabled: false },

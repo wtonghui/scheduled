@@ -29,6 +29,13 @@ export const taskInFlight = new Gauge({
   help: "currently running tasks",
 });
 
+export const taskClaimDurationMs = new Histogram({
+  name: "scheduled_claim_duration_ms",
+  help: "claim round duration in milliseconds by phase (read/write)",
+  labelNames: ["phase"],
+  buckets: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000],
+});
+
 export const deadLetterTotal = new Counter({
   name: "scheduled_task_dead_letter_total",
   help: "dead-lettered jobs",
@@ -68,6 +75,12 @@ export const outboxFailed = new Gauge({
 export const outboxDead = new Gauge({
   name: "scheduled_outbox_dead",
   help: "dead-lettered rows in email_log + webhook_delivery outboxes (need redrive)",
+});
+
+export const archiveMovedTotal = new Counter({
+  name: "scheduled_archive_moved_total",
+  help: "rows moved to *_archive tables by the retention job",
+  labelNames: ["table"],
 });
 
 export const webhookBreakersOpen = new Gauge({

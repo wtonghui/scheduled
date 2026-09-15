@@ -85,6 +85,7 @@ export default function EmailsPage() {
           ) : undefined
         }
       />
+      <p className="mb-3 text-[12px] text-text-muted">仅展示近 90 天记录，更早的已归档。</p>
 
       <div className="mb-4 flex items-center gap-3">
         <div>
