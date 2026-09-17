@@ -32,7 +32,9 @@ export const PATCH = requireAuth({ scopes: ["tasks:write"] })(
       const body = await req.json();
       const systemUserIdHeader = req.headers.get("x-system-user-id") as string | null;
       const updateBody = systemUserIdHeader ? { ...body, systemUserId: systemUserIdHeader } : body;
-      const task = await taskService.update(auth.tenantId, id, updateBody);
+      const task = await taskService.update(auth.tenantId, id, updateBody, {
+        actorTokenId: auth.tokenId,
+      });
       return ok(task);
     } catch (error) {
       return fail(error);

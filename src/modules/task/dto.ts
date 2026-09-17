@@ -231,6 +231,11 @@ export const UpdateTaskSchema = z
     emailBodyTemplate: z.string().trim().max(10_000).nullable().optional(),
     emailAttachmentUrlTemplate: z.string().trim().max(512).nullable().optional(),
     systemUserId: z.string().trim().max(191).nullable().optional(),
+    /**
+     * 配额账本重置（只允许 true；缺席=不重置，false 直接 400，逼调用方省略而非传假值）。
+     * 仅停用态可调（service 层验，启用态 400）；与 enabled:true 同包即原子复活。
+     */
+    resetConsumedRuns: z.literal(true).optional(),
     version: z.number().int().min(1),
   })
   .refine(

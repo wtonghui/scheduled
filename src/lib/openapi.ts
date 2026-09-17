@@ -198,6 +198,7 @@ registry.registerPath({
               overlapPolicy: { type: "string", enum: ["skip", "queue", "run"] },
               endsAt: { type: "string", format: "date-time", nullable: true },
               maxRuns: { ...INT, minimum: 1, nullable: true },
+              resetConsumedRuns: { type: "boolean", enum: [true] },
               startsAt: { type: "string", format: "date-time", nullable: true },
               skipHolidays: { type: "boolean" },
               holidayPolicy: { type: "string", enum: ["drop", "postpone"] },

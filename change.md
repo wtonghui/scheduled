@@ -97,7 +97,7 @@
 "runAt": "2026-09-01T10:00:00Z"    // 过去时刻，400
 ```
 
-**注意**：跑完自动 enabled=false 停用；禁止配 endsAt/maxRuns/overlapPolicy/startsAt；可配 skipHolidays/holidayPolicy（撞假日 postpone 顺延、drop 作废即创建 400）。
+**注意**：跑完自动 enabled=false 停用；禁止配 endsAt/maxRuns/overlapPolicy/startsAt；可配 skipHolidays/holidayPolicy（撞假日 postpone 顺延、drop 作废即创建 400）。停用时响应字段 disabledReason=run_once_done（见九）。
 
 ---
 
@@ -154,7 +154,7 @@
 "endsAt": "2026-12-31T23:59:59.000+08:00"
 ```
 
-**含义**：重复调度到达此时刻后停止（enabled=false）。与 maxRuns 可共存，谁先到谁停。仅重复调度可配。
+**含义**：重复调度到达此时刻后停止（enabled=false）。与 maxRuns 可共存，谁先到谁停。仅重复调度可配。停用时响应字段 disabledReason=ends_at（见九）。
 
 ### maxRuns — 总执行次数上限
 
@@ -171,7 +171,9 @@
 "maxRuns": 100
 ```
 
-**含义**：调度触发的总次数达到此值后停止。只统计调度触发，手动 run-now、重试、跳过（skipped）不计。仅重复调度可配。
+**含义**：调度触发的总次数达到此值后停止。只统计调度触发，手动 run-now、重试、跳过（skipped）不计。仅重复调度可配。已用次数看响应字段 consumedRuns（X / maxRuns 即进度）；停用时 disabledReason=max_runs（见九）。
+
+**配额用尽后复活**：consumedRuns 是单调账本，编辑任务不会顺手清零。复活走 PATCH 显式 `resetConsumedRuns: true`（只能传 true，传 false 直接 400；仅停用态可调，启用态 400，操作记审计日志），常与 `enabled: true` 同包一次提交、原子复活。重启用时若配额仍用尽直接 400（“quota exhausted … raise maxRuns or reset quota first”），不会“启用又立刻死”。
 
 ### overlapPolicy — 重叠策略
 
@@ -361,7 +363,9 @@
 "enabled": true
 ```
 
-**含义**：是否参与 worker 领取调度。runAt 一次性任务跑完后自动置 false。可随时手动启用/停用。
+**含义**：是否参与 worker 领取调度。runAt 一次性任务跑完后自动置 false。可随时手动启用/停用。手动停用时响应字段 disabledReason=manual（操作 token 记入 disabledBy）；重启用后停用原因三字段清空（见九）。
+
+**重启用 fail-fast**：`enabled: true` 且当前停用时，服务端用生效后值校验，不过直接 400：配额用尽（`consumed>=maxRuns` 且本次没带 `resetConsumedRuns`）、截止已过（`endsAt` 不晚于首跑）、调度无未来运行。过了才重算 nextRunAt 并启用，不存在“启用成功、下轮又停用”的中间态。
 
 ---
 
@@ -642,6 +646,68 @@ X-Trigger-Type: 1
 | payload.url must be a valid URL | payload.url 不是合法 URL |
 | payload.method must be a standard HTTP method | method 不是枚举值 |
 | noop task must not carry a payload | taskType=noop 同时传了 payload |
+
+---
+
+## 九、任务只读状态字段（响应：详情/列表/创建/更新都带）
+
+任务是怎么结束的，直接看这三个字段（停用写时定夺，启用中为 null；重启用清空）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| disabledReason | string \| null | 停用原因，见下表 |
+| disabledAt | string \| null | 停用时刻（+08:00 偏移 ISO） |
+| disabledBy | string \| null | 停用人：手动=操作 tokenId，自动=worker 实例 id |
+
+| disabledReason | 含义 |
+|------|------|
+| manual | 手动停止（PATCH enabled=false） |
+| run_once_done | 仅执行一次自动停止（runAt 跑完） |
+| ends_at | 到了截止时间停止的 |
+| max_runs | 到了最大执行次数停止的 |
+| no_future_schedule | 调度本身无未来运行（如 cron 年份已过） |
+| unknown | 历史未知（本次变更前已停用的老数据回填值） |
+
+执行进度与租约（同样只读，看“跑了多少 / 是不是还在跑”）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| consumedRuns | number | 已消耗配额（调度触发计；run-now/重试/跳过不计；归档不影响，永不复活）。`consumedRuns / maxRuns` 即进度 |
+| claimedBy | string \| null | 当前领取该任务的 worker 实例 id；null=空闲 |
+| claimedUntil | string \| null | 租约到期时间；过期可被回收重领 |
+
+**示例**（到最大次数停止的任务详情片段）：
+
+```json
+{
+  "enabled": false,
+  "disabledReason": "max_runs",
+  "disabledAt": "2026-09-17T10:35:35.126+08:00",
+  "disabledBy": "wk-host-1234",
+  "maxRuns": 5,
+  "consumedRuns": 5,
+  "claimedBy": null,
+  "claimedUntil": null
+}
+```
+
+**注意**：tenantId / ownerTokenId 不对外返回（租户隔离边界）。
+
+### PATCH /api/v1/tasks/:id 新增字段 resetConsumedRuns
+
+| 属性 | 值 |
+|------|------|
+| 类型 | 字面量 true（可选） |
+| 是否必传 | 否（缺席=不重置） |
+| 格式 | 只能传 `true`；传 `false` 直接 400，请省略 |
+
+**规则**：仅停用态可调（启用态 400）；与本次其它写入（改规则/重启用）进同一条 version 条件更新，单语句原子。重置记审计日志（谁、何时、旧值→0）。典型复活一次提交：
+
+```json
+{ "resetConsumedRuns": true, "enabled": true, "version": 3 }
+```
+
+**注意**：编辑任务（改名、改规则、加截止）永远不会顺手清零计数器；并发两个同 version 的 PATCH 恰好一个成功（409），配额不会被双重置。
 
 ---
 

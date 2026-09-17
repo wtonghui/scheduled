@@ -141,9 +141,14 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `overlapPolicy` | string | 重叠策略：`skip`（默认）/ `queue` / `run` |
 | `endsAt` | string \| null | 重复调度截止时刻 |
 | `maxRuns` | number \| null | 重复调度总次数上限 |
+| `consumedRuns` | number | 已消耗配额（调度触发计；与 `maxRuns` 配对看进度，归档不影响） |
+| `claimedBy` / `claimedUntil` | string \| null | 当前租约持有 worker / 租约到期时间（null=空闲；过期可被回收重领） |
 | `taskType` | `http` \| `noop` | 执行器类型 |
 | `payload` | object | 执行负载（`http` 型见下，`noop` 型为 `{}`） |
 | `enabled` | boolean | 是否启用；`false` 时不再调度 |
+| `disabledReason` | string \| null | 停用原因（写时定夺，持久化；启用中为 null）：`manual` 手动停止 / `run_once_done` 仅执行一次自动停止 / `ends_at` 到截止时间停止 / `max_runs` 到最大执行次数停止 / `no_future_schedule` 无未来计划 / `unknown` 历史未知 |
+| `disabledAt` | string \| null | 停用时刻（ISO；启用中为 null） |
+| `disabledBy` | string \| null | 停用人：手动=操作 tokenId，自动=worker 实例 id（启用中为 null） |
 | `maxAttempts` | number | 同次调度内最多尝试次数（1–10） |
 | `timeoutMs` | number | 单次执行超时（毫秒） |
 | `recipients` | string[] | 终态邮件收件人 |
@@ -783,8 +788,41 @@ curl http://localhost:3000/api/v1/tasks/cmt6yqpo50003m0vispoa9p9h/email-logs?pag
 - **节假日**：`skipHolidays=true` 时查日历；`drop`（默认）当次作废取下一非假日点，`postpone` 顺延到下一工作日同墙钟时刻。API 不可达按工作日处理（fail-open）。
 - **重叠策略**（`overlapPolicy`，仅重复调度）：`skip`（默认）跳过 / `queue` 排队 / `run` 允许并行。
 - **结束规则**（`endsAt` / `maxRuns`，仅重复调度，可共存）：谁先到谁停。
+- **结束原因**：任务停用时写 `disabledReason`（`manual` / `run_once_done` / `ends_at` / `max_runs` / `no_future_schedule` / `unknown`）+ `disabledAt` + `disabledBy`；重启用清空。
+- **执行进度**：`consumedRuns` 为已消耗配额（调度触发计；与 `maxRuns` 配对看进度，归档不影响）；`claimedBy` / `claimedUntil` 为当前租约持有 worker / 到期时间（null=空闲）。
 - **时间基准**：调度按 UTC 自洽；REST 返回 `+08:00` 偏移的 ISO 8601。
 - **不补跑**：worker 停机错过的运行不补执行，只推进到下一次未来触发。
+
+查询任务是怎么结束的（详情/列表/创建/更新响应都带这几个只读字段）：
+
+```bash
+curl http://localhost:3000/api/v1/tasks/<task-id> \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt"
+```
+
+```json
+{ "success": true, "data": {
+    "enabled": false,
+    "disabledReason": "max_runs",
+    "disabledAt": "2026-09-17T10:35:35.126+08:00",
+    "disabledBy": "wk-host-1234",
+    "maxRuns": 5,
+    "consumedRuns": 5
+} }
+```
+
+`disabledReason` 取值：`manual` 手动停止 / `run_once_done` 仅执行一次自动停止 / `ends_at` 到截止时间停止 / `max_runs` 到最大执行次数停止 / `no_future_schedule` 无未来计划 / `unknown` 历史未知。启用中三字段为 null。
+
+**配额复活**：`consumedRuns` 是单调账本，编辑任务不会顺手清零。复活走 `PATCH /api/v1/tasks/:id` 显式 `resetConsumedRuns: true`（只能传 `true`，仅停用态可调，记审计日志），常与 `enabled: true` 同包一次提交、原子复活：
+
+```bash
+curl -X PATCH http://localhost:3000/api/v1/tasks/<task-id> \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt" \
+  -H "Content-Type: application/json" \
+  -d '{"resetConsumedRuns":true,"enabled":true,"version":3}'
+```
+
+**重启用 fail-fast**：停用任务传 `enabled: true` 时，服务端用生效后值校验——配额仍用尽 / 截止已过 / 调度无未来运行直接 `400`，过了才重算 `nextRunAt` 并启用，不存在“启用成功、下轮又停用”的中间态。
 
 <h2 id="notification">7 · 结果通知</h2>
 

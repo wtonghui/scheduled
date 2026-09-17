@@ -41,6 +41,8 @@ type TaskRow = Prisma.TaskGetPayload<{
     endsAt: true;
     maxRuns: true;
     consumedRuns: true;
+    claimedBy: true;
+    claimedUntil: true;
     startsAt: true;
     skipHolidays: true;
     holidayPolicy: true;
@@ -52,6 +54,9 @@ type TaskRow = Prisma.TaskGetPayload<{
     emailBodyTemplate: true;
     emailAttachmentUrlTemplate: true;
     enabled: true;
+    disabledReason: true;
+    disabledAt: true;
+    disabledBy: true;
     maxAttempts: true;
     timeoutMs: true;
     recipients: true;
@@ -80,6 +85,12 @@ export interface TaskView {
   endsAt: Date | null;
   /** 重复调度总次数上限（调度触发计，run-now/重试/跳过不计） */
   maxRuns: number | null;
+  /** 已消耗配额（调度触发计，与 maxRuns 配对看进度；归档不影响，永不复活） */
+  consumedRuns: number;
+  /** 当前领取该任务的 worker 实例 id；null=无租约（空闲） */
+  claimedBy: string | null;
+  /** 租约到期时间；过期可被重新领取/回收 */
+  claimedUntil: Date | null;
   /** 重复调度的开始时刻；首跑从此起算，之后自然失效 */
   startsAt: Date | null;
   /** 到点遇假日是否跳过/顺延 */
@@ -89,6 +100,12 @@ export interface TaskView {
   taskType: "http" | "noop";
   payload: Record<string, unknown>;
   enabled: boolean;
+  /** 停用原因（写时定夺）：manual 手动 / run_once_done 单次跑完 / ends_at 到截止 / max_runs 到次数 / no_future_schedule 无未来计划 / unknown 历史未知；启用中为 null */
+  disabledReason: string | null;
+  /** 停用时刻；启用中为 null */
+  disabledAt: Date | null;
+  /** 停用人：手动=操作 tokenId，自动=worker 实例 id；启用中为 null */
+  disabledBy: string | null;
   maxAttempts: number;
   timeoutMs: number;
   recipients: string[];
@@ -405,12 +422,18 @@ function toView(row: TaskRow, upcoming: UpcomingInfo | null = null): TaskView {
     overlapPolicy: row.overlapPolicy,
     endsAt: row.endsAt,
     maxRuns: row.maxRuns,
+    consumedRuns: Number(row.consumedRuns ?? 0),
+    claimedBy: row.claimedBy ?? null,
+    claimedUntil: row.claimedUntil ?? null,
     startsAt: row.startsAt,
     skipHolidays: row.skipHolidays,
     holidayPolicy: row.holidayPolicy,
     taskType: row.taskType,
     payload,
     enabled: row.enabled,
+    disabledReason: row.disabledReason ?? null,
+    disabledAt: row.disabledAt ?? null,
+    disabledBy: row.disabledBy ?? null,
     maxAttempts: row.maxAttempts,
     timeoutMs: row.timeoutMs,
     recipients: row.recipients as string[],
@@ -598,7 +621,12 @@ export async function create(
   return { ...toView(row), upcoming: await safeUpcomingForRow(row) };
 }
 
-export async function update(tenantId: string, id: string, input: unknown): Promise<TaskView> {
+export async function update(
+  tenantId: string,
+  id: string,
+  input: unknown,
+  opts: { actorTokenId?: string } = {},
+): Promise<TaskView> {
   const parsed = UpdateTaskSchema.safeParse(input);
   if (!parsed.success) {
     throw new AppError(
@@ -614,6 +642,21 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
   if (!existing) {
     throw new AppError(404, "NOT_FOUND", "task not found");
   }
+
+  // 配额账本重置（显式动作，非编辑副作用）：
+  // - 仅停用态可调：启用态直接 400（防误触多发配额；想刷运行中任务的配额请先停用）。
+  // - 与本次其它写入进同一条 updateMany（version 谓词），单语句原子，无中间态。
+  // - 分布式安全：claim 谓词只读行状态，停用态下调度领取本来就拿不到行；manual 永不计数；
+  //   读-写间隙若有在途执行 +1（它在创建时已合法占位），重置不影响其执行、不超发，
+  //   最坏只是审计日志里的旧值差 1。
+  const resettingQuota = data.resetConsumedRuns === true;
+  if (resettingQuota && existing.enabled) {
+    throw new AppError(400, "VALIDATION", "quota can only be reset on a disabled task");
+  }
+  const effectiveConsumed = resettingQuota ? 0 : Number(existing.consumedRuns ?? 0);
+  const effectiveMaxRuns = data.maxRuns !== undefined ? data.maxRuns : existing.maxRuns;
+  const effectiveEndsAt =
+    data.endsAt !== undefined ? (data.endsAt ? new Date(data.endsAt) : null) : existing.endsAt;
 
   const effectiveType = (data.taskType ?? existing.taskType) as "http" | "noop";
 
@@ -728,8 +771,16 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
       throw new AppError(400, "VALIDATION", "endsAt is before the first scheduled run");
     }
   }
+  // 停用原因写时定夺：手动停用打 manual 戳；重启用清空（上次怎么停的不污染下一次）
+  let stopFields: Prisma.TaskUpdateInput | undefined;
   if (data.enabled === false) {
     nextRunAt = null;
+    // 手动停用：写时定夺停用原因（重启用/自动停用会覆盖或清空）
+    stopFields = {
+      disabledReason: "manual",
+      disabledAt: new Date(),
+      disabledBy: opts.actorTokenId ?? null,
+    };
   } else if (data.enabled === true && existing.enabled === false) {
     // 重启用：按既有调度（含一次性时刻与时区）重算；已过的一次性时刻由 worker 到期即领
     const reSchedule = {
@@ -747,6 +798,25 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
       timezone: existing.timezone,
       schedule: reSchedule,
     });
+    // 重启用 fail-fast：有问题的复活直接 400，不进“启用又立刻死”循环。
+    // 判的是生效后值（重置/同包新规则都已折入），与创建校验同口径。
+    if (effectiveMaxRuns != null && effectiveConsumed >= effectiveMaxRuns) {
+      throw new AppError(
+        400,
+        "VALIDATION",
+        `quota exhausted (consumed ${effectiveConsumed}/${effectiveMaxRuns}): raise maxRuns or reset quota first`,
+      );
+    }
+    if (effectiveEndsAt && nextRunAt && effectiveEndsAt.getTime() <= nextRunAt.getTime()) {
+      throw new AppError(400, "VALIDATION", "endsAt is before the first scheduled run");
+    }
+    if (!nextRunAt && !existing.runAt) {
+      // 重复调度算不出下次（cron 年份过期等）：拒绝启用僵尸任务。
+      // runAt 单次除外——已过时刻按既有语义由 worker 到期即领。
+      throw new AppError(400, "VALIDATION", "schedule yields no future run");
+    }
+    // 重启用清空停用原因三字段
+    stopFields = { disabledReason: null, disabledAt: null, disabledBy: null };
   }
 
   const row = await updateTaskWithVersion(
@@ -786,6 +856,9 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
         payloadSecrets: secretsUpdate ? new Uint8Array(secretsUpdate) : null,
       }),
       ...(data.enabled !== undefined && { enabled: data.enabled }),
+      ...(stopFields ?? {}),
+      // 配额清零与其它写入同一语句（version 谓词），原子提交
+      ...(resettingQuota && { consumedRuns: 0 }),
       ...(data.maxAttempts !== undefined && { maxAttempts: data.maxAttempts }),
       ...(data.timeoutMs !== undefined && { timeoutMs: data.timeoutMs }),
       ...(data.recipients !== undefined && {
@@ -816,6 +889,18 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
   );
   if (!row) {
     throw new AppError(404, "NOT_FOUND", "task not found");
+  }
+  if (resettingQuota) {
+    // 配额重置审计（对齐 sign secret 轮换口径）；consumed_before 是读时快照，
+    // 读-写间隙的在途 +1 只影响这个数字，不影响正确性（见上）。
+    logger.warn(
+      {
+        task_id: id,
+        actor: opts.actorTokenId ?? null,
+        consumed_before: Number(existing.consumedRuns ?? 0),
+      },
+      "quota reset",
+    );
   }
   return { ...toView(row), upcoming: await safeUpcomingForRow(row) };
 }

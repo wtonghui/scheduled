@@ -21,11 +21,19 @@ export type ClaimItem =
   | { kind: "scheduled"; task: RunTaskDefinition; scheduledAt: Date }
   | { kind: "manual"; task: RunTaskDefinition; scheduledAt: Date; executionId: string };
 
+/**
+ * 自动停用原因（写时定夺，与 TaskStopReason 枚举同值）：
+ * run_once_done 单次跑完 / ends_at 到截止 / max_runs 到次数 / no_future_schedule 无未来计划。
+ * 优先级与 planDueRow 一致：先 maxRuns 再 endsAt（共存时谁先命中记谁）。
+ */
+export type AutoStopReason = "run_once_done" | "ends_at" | "max_runs" | "no_future_schedule";
+
 export type { RunTaskDefinition };
 
 interface DueRow {
   id: string;
   cron: string | null;
+  runAt: Date | null;
   scheduleIntervalSeconds: number | null;
   timezone: string;
   overlapPolicy: string;
@@ -99,7 +107,7 @@ function toTaskDefinition(row: DueRow): RunTaskDefinition {
 }
 
 const TASK_COLUMNS = Prisma.sql`
-  id, cron, schedule_interval_seconds AS scheduleIntervalSeconds,
+  id, cron, run_at AS runAt, schedule_interval_seconds AS scheduleIntervalSeconds,
   timezone, overlap_policy AS overlapPolicy, ends_at AS endsAt, max_runs AS maxRuns,
   consumed_runs AS consumedRuns,
   skip_holidays AS skipHolidays, holiday_policy AS holidayPolicy,
@@ -187,6 +195,37 @@ interface DuePlan {
   tick: Date;
   advanceTo: Date | null;
   action: "claim" | "disable";
+  /** 停用原因：disable 必有；claim 仅 advanceTo==null 时有（本轮跑完即止） */
+  stopReason: AutoStopReason | null;
+}
+
+/**
+ * 自动停用原因判定（纯函数，供 claim/对账共用）：
+ * advanceTo 非空 → 任务继续，无原因；为空 → 按 maxRuns → endsAt → runAt → 无未来计划判定。
+ */
+export function resolveAutoStopReason(
+  row: { runAt: Date | null; endsAt: Date | null; maxRuns: number | bigint | null; consumedRuns: number | bigint },
+  tick: Date,
+  rawNext: Date | null,
+  advanceTo: Date | null,
+): AutoStopReason | null {
+  if (advanceTo) {
+    return null;
+  }
+  if (row.maxRuns != null && Number(row.consumedRuns ?? 0) >= Number(row.maxRuns)) {
+    return "max_runs";
+  }
+  if (row.endsAt && tick.getTime() > row.endsAt.getTime()) {
+    return "ends_at";
+  }
+  // 下次已超截止（tick 仍在窗口内，本轮跑完即止）
+  if (row.endsAt && rawNext && rawNext.getTime() > row.endsAt.getTime()) {
+    return "ends_at";
+  }
+  if (row.runAt) {
+    return "run_once_done";
+  }
+  return "no_future_schedule";
 }
 
 /**
@@ -197,11 +236,11 @@ async function planDueRow(row: DueRow, now: Date): Promise<DuePlan> {
   const tick = new Date(row.nextRunAt);
   // maxRuns 计已执行次数：用尽则本轮不跑（跑了就超配额）
   if (row.maxRuns != null && Number(row.consumedRuns ?? 0) >= Number(row.maxRuns)) {
-    return { row, tick, advanceTo: null, action: "disable" };
+    return { row, tick, advanceTo: null, action: "disable", stopReason: "max_runs" };
   }
   // endsAt 按本轮 tick 判定（tick 在窗口内就执行；重算的下次超窗只影响推进）
   if (row.endsAt && tick.getTime() > row.endsAt.getTime()) {
-    return { row, tick, advanceTo: null, action: "disable" };
+    return { row, tick, advanceTo: null, action: "disable", stopReason: "ends_at" };
   }
   const rawNext = computeNextRun(
     { cron: row.cron, scheduleIntervalSeconds: row.scheduleIntervalSeconds },
@@ -212,7 +251,7 @@ async function planDueRow(row: DueRow, now: Date): Promise<DuePlan> {
   // 走原领取路径执行一次并停用（既有语义）
   const next = await applyTaskHolidays(rawNext, row);
   const advanceTo = next && row.endsAt && next.getTime() > row.endsAt.getTime() ? null : next;
-  return { row, tick, advanceTo, action: "claim" };
+  return { row, tick, advanceTo, action: "claim", stopReason: resolveAutoStopReason(row, tick, next, advanceTo) };
 }
 
 /**
@@ -222,13 +261,18 @@ async function planDueRow(row: DueRow, now: Date): Promise<DuePlan> {
  * tick 精度假设：next_run_at 全经 JS Date 写入（毫秒精度），DB 往返无损，等值安全。
  */
 function claimDueSql(plan: DuePlan, workerId: string, leaseSeconds: number): Prisma.Sql {
-  const { row, tick, advanceTo } = plan;
+  const { row, tick, advanceTo, stopReason } = plan;
+  // 停用原因与停用写原子同行：继续跑则清空（重启用语义），停用则写时定夺
+  const stopColumns = advanceTo
+    ? Prisma.sql`, disabled_reason = NULL, disabled_at = NULL, disabled_by = NULL`
+    : Prisma.sql`, disabled_reason = ${stopReason}, disabled_at = NOW(), disabled_by = ${workerId}`;
   return Prisma.sql`
     UPDATE task
     SET claimed_by = ${workerId},
         claimed_until = DATE_ADD(NOW(), INTERVAL ${leaseSeconds} SECOND),
         next_run_at = ${advanceTo},
         enabled = ${advanceTo ? 1 : 0}
+        ${stopColumns}
     WHERE id = ${row.id}
       AND next_run_at = ${tick}
       AND (claimed_until IS NULL OR claimed_until < NOW())
@@ -241,11 +285,11 @@ function claimDueSql(plan: DuePlan, workerId: string, leaseSeconds: number): Pri
  * 认领失败定夺（SETTLE 阶段，事务外，只走失败路径）：重读区分被抢先（tick 已变→不管）、
  * 配额用尽/超窗（条件停用，tick guard 防覆盖）。误判最多多打日志，不影响正确性。
  */
-async function settleFailedClaim(plan: DuePlan): Promise<void> {
+async function settleFailedClaim(plan: DuePlan, workerId: string): Promise<void> {
   const { row, tick } = plan;
   const fresh = await prisma.task.findUnique({
     where: { id: row.id },
-    select: { nextRunAt: true, maxRuns: true, consumedRuns: true, endsAt: true },
+    select: { nextRunAt: true, maxRuns: true, consumedRuns: true, endsAt: true, runAt: true },
   });
   if (!fresh?.nextRunAt || fresh.nextRunAt.getTime() !== tick.getTime()) {
     return; // 被别实例推进/停用/删除：不管
@@ -254,7 +298,7 @@ async function settleFailedClaim(plan: DuePlan): Promise<void> {
     if (Number(fresh.consumedRuns ?? 0) >= Number(fresh.maxRuns)) {
       await prisma.task.updateMany({
         where: { id: row.id, nextRunAt: tick },
-        data: { nextRunAt: null, enabled: false },
+        data: { nextRunAt: null, enabled: false, disabledReason: "max_runs", disabledAt: new Date(), disabledBy: workerId },
       });
       return;
     }
@@ -262,7 +306,7 @@ async function settleFailedClaim(plan: DuePlan): Promise<void> {
   if (fresh.endsAt && tick.getTime() > fresh.endsAt.getTime()) {
     await prisma.task.updateMany({
       where: { id: row.id, nextRunAt: tick },
-      data: { nextRunAt: null, enabled: false },
+      data: { nextRunAt: null, enabled: false, disabledReason: "ends_at", disabledAt: new Date(), disabledBy: workerId },
     });
   }
   // 租约竞输：下轮再领
@@ -348,7 +392,9 @@ export async function claimDueItems(
       if (plan.action === "disable") {
         // 停用条件写时重验（READ 快照可能已过期：用户放宽 endsAt/maxRuns 后谓词不成立则 0 行跳过，下轮正常领取）
         await tx.$executeRaw(
-          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${plan.row.id} AND next_run_at = ${plan.tick}
+          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0,
+              disabled_reason = ${plan.stopReason}, disabled_at = NOW(), disabled_by = ${workerId}
+            WHERE id = ${plan.row.id} AND next_run_at = ${plan.tick}
             AND ((max_runs IS NOT NULL AND consumed_runs >= max_runs)
               OR (ends_at IS NOT NULL AND ${plan.tick} > ends_at))`,
         );
@@ -377,7 +423,9 @@ export async function claimDueItems(
       if (plan.action === "disable") {
         // 同上：停用条件写时重验，用户放宽配置后 0 行跳过
         await tx.$executeRaw(
-          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id} AND next_run_at = ${tick}
+          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0,
+              disabled_reason = ${plan.stopReason}, disabled_at = NOW(), disabled_by = ${workerId}
+            WHERE id = ${row.id} AND next_run_at = ${tick}
             AND ((max_runs IS NOT NULL AND consumed_runs >= max_runs)
               OR (ends_at IS NOT NULL AND ${tick} > ends_at))`,
         );
@@ -386,6 +434,11 @@ export async function claimDueItems(
       if (row.overlapPolicy === "run") {
         // 显式允许并行：无视租约强领（用户自担双跑风险），但 tick guard + endsAt/maxRuns 谓词仍要：
         // 读写之间配额被打满时写瞬间驳回（0 行 → settle 定夺停用），配额永不超发
+        // 停用原因与停用写原子同行：继续跑则清空，重启用语义
+        const stopColumns =
+          plan.advanceTo != null
+            ? Prisma.sql`, disabled_reason = NULL, disabled_at = NULL, disabled_by = NULL`
+            : Prisma.sql`, disabled_reason = ${plan.stopReason}, disabled_at = NOW(), disabled_by = ${workerId}`;
         const claimed = await tx.$executeRaw(
           Prisma.sql`
             UPDATE task
@@ -393,6 +446,7 @@ export async function claimDueItems(
                 claimed_until = DATE_ADD(NOW(), INTERVAL ${leaseSeconds} SECOND),
                 next_run_at = ${advanceTo},
                 enabled = ${advanceTo ? 1 : 0}
+                ${stopColumns}
             WHERE id = ${row.id} AND next_run_at = ${tick}
               AND (ends_at IS NULL OR ${tick} <= ends_at)
               AND (max_runs IS NULL OR consumed_runs < max_runs)
@@ -410,8 +464,14 @@ export async function claimDueItems(
         continue;
       }
       // 推进时刻（tick guard 防并发复写 + endsAt/maxRuns 写时重验；读写之间配额被打满则 0 行 → settle 定夺停用）
+      // advanceTo==null 则本轮推进即止（plan.stopReason 已判：下次超窗 ends_at / 单次跑完 / 无未来计划）
+      const blockedStopColumns =
+        advanceTo != null
+          ? Prisma.sql`, disabled_reason = NULL, disabled_at = NULL, disabled_by = NULL`
+          : Prisma.sql`, disabled_reason = ${plan.stopReason}, disabled_at = NOW(), disabled_by = ${workerId}`;
       const advanced = await tx.$executeRaw(
         Prisma.sql`UPDATE task SET next_run_at = ${advanceTo}, enabled = ${advanceTo ? 1 : 0}
+            ${blockedStopColumns}
           WHERE id = ${row.id} AND next_run_at = ${tick} AND next_run_at <= NOW()
             AND (ends_at IS NULL OR ${tick} <= ends_at)
             AND (max_runs IS NULL OR consumed_runs < max_runs)`,
@@ -521,7 +581,7 @@ export async function claimDueItems(
 
   // ── SETTLE（事务外）：认领失败重读定夺（停用/跳过），只走失败路径
   for (const plan of failures) {
-    await settleFailedClaim(plan);
+    await settleFailedClaim(plan, workerId);
   }
 
   taskClaimDurationMs.observe({ phase: "read" }, readMs);
@@ -562,7 +622,11 @@ async function releaseAdvanceLock(holder: string): Promise<void> {
  * 并发安全：单 flight（多实例同时重启只一个执行，其余 return 0）+ 所有写带 tick guard，
  * 停用写额外带条件谓词（写瞬间用最新值重验，防旧快照在用户放宽配置后误停）。
  */
-export async function advanceMissedRuns(now = new Date(), holderId?: string): Promise<number> {
+export async function advanceMissedRuns(
+  now = new Date(),
+  holderId?: string,
+  actorId = "scheduler",
+): Promise<number> {
   const holder = holderId ?? randomUUID();
   if (!(await tryAcquireAdvanceLock(holder))) {
     logger.info("advanceMissedRuns skipped (another instance holds the lock)");
@@ -581,6 +645,7 @@ export async function advanceMissedRuns(now = new Date(), holderId?: string): Pr
         id: true,
         nextRunAt: true,
         cron: true,
+        runAt: true,
         scheduleIntervalSeconds: true,
         timezone: true,
         endsAt: true,
@@ -604,7 +669,8 @@ export async function advanceMissedRuns(now = new Date(), holderId?: string): Pr
           // maxRuns 用尽 → 直接停用（读 consumedRuns 列，不数全表；归档不影响）。
           // 写时重验：快照过期（用户放宽 maxRuns）或 tick 已被推进则 0 行跳过。
           if (task.maxRuns != null && Number(task.consumedRuns ?? 0) >= Number(task.maxRuns)) {
-            await prisma.$executeRaw`UPDATE task SET next_run_at = NULL, enabled = 0
+            await prisma.$executeRaw`UPDATE task SET next_run_at = NULL, enabled = 0,
+                disabled_reason = 'max_runs', disabled_at = NOW(), disabled_by = ${actorId}
               WHERE id = ${task.id} AND next_run_at = ${tick}
                 AND max_runs IS NOT NULL AND consumed_runs >= max_runs`;
             return;
@@ -616,7 +682,8 @@ export async function advanceMissedRuns(now = new Date(), holderId?: string): Pr
             if (tickTime <= task.endsAt.getTime()) {
               return;
             }
-            await prisma.$executeRaw`UPDATE task SET next_run_at = NULL, enabled = 0
+            await prisma.$executeRaw`UPDATE task SET next_run_at = NULL, enabled = 0,
+                disabled_reason = 'ends_at', disabled_at = NOW(), disabled_by = ${actorId}
               WHERE id = ${task.id} AND next_run_at = ${tick}
                 AND ends_at IS NOT NULL AND ${tick} > ends_at`;
             return;
@@ -627,11 +694,19 @@ export async function advanceMissedRuns(now = new Date(), holderId?: string): Pr
             task.timezone,
           );
           const next = await applyTaskHolidays(rawNext, task);
-          // 到此 maxRuns/endsAt 已处理（上早退），只剩无下次 → 停用（tick guard 防盖住领取循环的推进）
+          // 到此 maxRuns/endsAt 已处理（上早退），只剩无下次 → 停用（tick guard 防盖住领取循环的推进）；
+          // 单次任务归 run_once_done，其余归无未来计划
           if (!next) {
+            const stopReason = task.runAt ? "run_once_done" : "no_future_schedule";
             await prisma.task.updateMany({
               where: { id: task.id, nextRunAt: tick },
-              data: { nextRunAt: null, enabled: false },
+              data: {
+                nextRunAt: null,
+                enabled: false,
+                disabledReason: stopReason,
+                disabledAt: new Date(),
+                disabledBy: actorId,
+              },
             });
             return;
           }

@@ -27,12 +27,19 @@ interface TaskDetail {
   overlapPolicy: string;
   endsAt: string | null;
   maxRuns: number | null;
+  consumedRuns: number;
+  claimedBy: string | null;
+  claimedUntil: string | null;
   startsAt: string | null;
   skipHolidays: boolean;
   holidayPolicy: string;
   taskType: "http" | "noop";
   payload: Record<string, unknown>;
   enabled: boolean;
+  /** 停用原因（写时定夺，持久化）：manual 手动 / run_once_done 单次跑完 / ends_at 到截止 / max_runs 到次数 / no_future_schedule 无未来计划 / unknown 历史未知；启用中为 null */
+  disabledReason: string | null;
+  disabledAt: string | null;
+  disabledBy: string | null;
   maxAttempts: number;
   timeoutMs: number;
   recipients: string[];
@@ -75,6 +82,26 @@ const STATUS_TONE: Record<string, "ok" | "info" | "bad" | "warn" | "neutral"> = 
 
 function overlapLabel(policy: string): string {
   return policy === "queue" ? "排队" : policy === "run" ? "允许并行" : "跳过";
+}
+
+/** 持久化停用原因中文（优先于 upcoming 推断）。 */
+function stopReasonLabel(reason: string | null): string | null {
+  switch (reason) {
+    case "manual":
+      return "手动停止";
+    case "run_once_done":
+      return "仅执行一次，已自动停止";
+    case "ends_at":
+      return "已到截止时间";
+    case "max_runs":
+      return "已达最大执行次数";
+    case "no_future_schedule":
+      return "无未来计划";
+    case "unknown":
+      return "原因未知（历史数据）";
+    default:
+      return null;
+  }
 }
 
 export default function TaskDetailPage() {
@@ -143,6 +170,34 @@ export default function TaskDetailPage() {
     }
   };
 
+  /** 配额复活：清零 + 重启用一次 PATCH 原子提交（version 锁防并发覆盖）。 */
+  const reviveQuota = async () => {
+    if (!task) return;
+    const ok = await confirm({
+      title: `重置「${task.name}」的执行配额并重新启用？`,
+      description: `当前已用 ${task.consumedRuns ?? 0} / 上限 ${task.maxRuns}，重置后从 0 重新计数，该操作记审计日志。`,
+      confirmText: "重置并启用",
+      tone: "primary",
+    });
+    if (!ok) return;
+    try {
+      const updated = await api.patch<TaskDetail>(`/api/v1/tasks/${id}`, {
+        resetConsumedRuns: true,
+        enabled: true,
+        version: task.version,
+      });
+      setTask(updated.data);
+      setEnabled(updated.data.enabled);
+      toast("配额已重置并重新启用", "success");
+    } catch (err) {
+      if (err instanceof ApiClientError && err.status === 409) {
+        setError("版本冲突：任务已被其他人修改，请刷新后重试");
+      } else {
+        setError(err instanceof ApiClientError ? err.message : String(err));
+      }
+    }
+  };
+
   const remove = async () => {
     const ok = await confirm({
       title: `删除任务「${task?.name}」？`,
@@ -177,8 +232,11 @@ export default function TaskDetailPage() {
     ? `仅一次 ${new Date(task.runAt).toLocaleString()}`
     : (task.cron ?? (task.scheduleIntervalSeconds ? `每 ${task.scheduleIntervalSeconds} 秒` : "—"));
   // 服务端测算优先（含节假日/起止/配额），失败或缺失回退存储值；已结束则附原因
-  const stoppedSuffix =
-    task.upcoming && !task.upcoming.scheduledAt && task.upcoming.stoppedReason === "maxRuns"
+  // 持久化停用原因优先（写时定夺），upcoming 推断仅作回退
+  const persistedStop = stopReasonLabel(task.disabledReason);
+  const stoppedSuffix = persistedStop
+    ? `（${persistedStop}）`
+    : task.upcoming && !task.upcoming.scheduledAt && task.upcoming.stoppedReason === "maxRuns"
       ? "（次数已用完）"
       : task.upcoming && !task.upcoming.scheduledAt && task.upcoming.stoppedReason === "endsAt"
         ? "（已过截止）"
@@ -211,6 +269,15 @@ export default function TaskDetailPage() {
     ["重叠策略", overlapLabel(task.overlapPolicy)],
     ["截止", task.endsAt ? new Date(task.endsAt).toLocaleString() : "持续到手动停"],
     ["总次数", task.maxRuns != null ? String(task.maxRuns) : "不限"],
+    ["已执行", task.maxRuns != null ? `${task.consumedRuns ?? 0} / ${task.maxRuns}` : String(task.consumedRuns ?? 0)],
+    ...(task.claimedBy
+      ? [
+          [
+            "租约",
+            `${task.claimedBy}${task.claimedUntil ? ` · 至 ${new Date(task.claimedUntil).toLocaleString()}` : ""}`,
+          ] as [string, React.ReactNode],
+        ]
+      : []),
     ["开始时间", task.startsAt ? new Date(task.startsAt).toLocaleString() : "立即开始"],
     [
       "节假日",
@@ -221,6 +288,14 @@ export default function TaskDetailPage() {
         : "不跳过",
     ],
     ["超时", `${task.timeoutMs}ms`],
+    ...(persistedStop
+      ? [
+          [
+            "结束原因",
+            `${persistedStop}${task.disabledAt ? ` · ${new Date(task.disabledAt).toLocaleString()}` : ""}${task.disabledBy ? ` · ${task.disabledBy}` : ""}`,
+          ] as [string, React.ReactNode],
+        ]
+      : []),
     ["收件人", task.recipients.join(", ") || "—"],
     ["回调", task.webhookUrl ? <code key="hook">{task.webhookUrl}</code> : "—"],
     ["系统用户", task.systemUserId ? <code key="sys-user">{task.systemUserId}</code> : "—"],
@@ -235,6 +310,7 @@ export default function TaskDetailPage() {
       <div className="mt-2 mb-4 flex items-center gap-3">
         <h1 className="text-[22px] leading-tight font-semibold text-text">{task.name}</h1>
         <Badge tone={task.enabled ? "ok" : "warn"}>{task.enabled ? "启用" : "停用"}</Badge>
+        {!task.enabled && persistedStop ? <Badge tone="neutral">{persistedStop}</Badge> : null}
         <Badge tone={task.taskType === "http" ? "info" : "neutral"}>{task.taskType}</Badge>
       </div>
 
@@ -292,6 +368,11 @@ export default function TaskDetailPage() {
             <Button variant="secondary" size="sm" onClick={runNow}>
               立即运行
             </Button>
+            {!task.enabled && task.maxRuns != null && (task.consumedRuns ?? 0) > 0 ? (
+              <Button variant="secondary" size="sm" onClick={reviveQuota}>
+                重置配额并启用
+              </Button>
+            ) : null}
             <Button variant="danger" size="sm" onClick={remove}>
               删除
             </Button>

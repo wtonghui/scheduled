@@ -34,10 +34,21 @@ interface TaskItem {
   scheduleIntervalSeconds: number | null;
   taskType: "http" | "noop";
   enabled: boolean;
+  /** 停用原因（写时定夺，持久化；启用中为 null） */
+  disabledReason: string | null;
   nextRunAt: string | null;
   version: number;
   writable: boolean;
 }
+
+const STOP_REASON_SHORT: Record<string, string> = {
+  manual: "手动",
+  run_once_done: "单次",
+  ends_at: "到期",
+  max_runs: "满次",
+  no_future_schedule: "无计划",
+  unknown: "未知",
+};
 
 function scheduleLabel(t: TaskItem): string {
   return t.cron ?? (t.scheduleIntervalSeconds ? `每 ${t.scheduleIntervalSeconds}s` : "—");
@@ -284,6 +295,11 @@ export default function TasksPage() {
               </div>
               <div>
                 <Badge tone={task.enabled ? "ok" : "warn"}>{task.enabled ? "启用" : "停用"}</Badge>
+                {!task.enabled && task.disabledReason && STOP_REASON_SHORT[task.disabledReason] ? (
+                  <span className="ml-1 text-[11px] text-text-faint">
+                    {STOP_REASON_SHORT[task.disabledReason]}
+                  </span>
+                ) : null}
               </div>
               <div className="justify-self-end">
                 {task.writable ? (

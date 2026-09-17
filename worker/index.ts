@@ -268,7 +268,7 @@ async function main(): Promise<void> {
   );
 
   // 重启对账：停机期间错过的调度**不补跑**（仅推进 next_run_at）；回收过期租约；整定孤儿执行
-  const advanced = await advanceMissedRuns();
+  const advanced = await advanceMissedRuns(new Date(), undefined, workerId);
   if (advanced > 0) {
     logger.info({ advanced }, "advanced missed runs after restart");
   }
