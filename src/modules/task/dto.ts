@@ -73,6 +73,65 @@ export const StartsAtSchema = z
 /** 节假日策略：drop 作废 / postpone 顺延到下一工作日同墙钟时刻；仅 skipHolidays=true 时有效。 */
 export const HolidayPolicySchema = z.enum(["drop", "postpone"]);
 
+/**
+ * 下次运行预览（未保存配置）：只接受重复调度（cron/interval 三选一之其一），
+ * runAt 由 service 显式拒绝（400，只做重复任务）。startsAt/endsAt 只验格式不验未来
+ * （预览旧配置应直接报 stopped，而不是 400）。
+ */
+export const PreviewNextRunSchema = z
+  .object({
+    cron: z.string().trim().optional(),
+    scheduleIntervalSeconds: z.number().int().min(1).optional(),
+    runAt: RunAtSchema.optional(),
+    timezone: TimezoneSchema.optional(),
+    startsAt: z
+      .string()
+      .trim()
+      .datetime({ offset: true, message: "startsAt must be an ISO 8601 datetime" })
+      .nullable()
+      .optional(),
+    endsAt: z
+      .string()
+      .trim()
+      .datetime({ offset: true, message: "endsAt must be an ISO 8601 datetime" })
+      .nullable()
+      .optional(),
+    maxRuns: MaxRunsSchema.nullable().optional(),
+    skipHolidays: z.boolean().default(false),
+    holidayPolicy: HolidayPolicySchema.default("drop"),
+    from: z
+      .string()
+      .trim()
+      .datetime({ offset: true, message: "from must be an ISO 8601 datetime" })
+      .optional(),
+    count: z.number().int().min(1).max(10).default(1),
+  })
+  .refine(
+    (d) =>
+      isValidScheduleTriple({
+        cron: d.cron ?? null,
+        scheduleIntervalSeconds: d.scheduleIntervalSeconds ?? null,
+        runAt: d.runAt ?? null,
+      }),
+    { message: "exactly one of cron, scheduleIntervalSeconds or runAt is required" },
+  )
+  .refine((d) => (d.cron ? isValidCron(d.cron) : true), {
+    message: "invalid cron expression",
+  })
+  .refine((d) => !(d.timezone && !d.cron && !d.runAt), {
+    message: "timezone is only meaningful with cron or runAt (fixed intervals carry no wall-clock)",
+  })
+  .refine((d) => !(d.runAt && (d.endsAt || d.maxRuns)), {
+    message: "run-once tasks take no endsAt or maxRuns (exactly one run)",
+  })
+  .refine((d) => !(d.runAt && d.startsAt), {
+    message: "run-once tasks take no startsAt (exactly one run)",
+  })
+  .refine((d) => d.holidayPolicy === "drop" || d.skipHolidays, {
+    message: "holidayPolicy requires skipHolidays=true",
+  });
+export type PreviewNextRunInput = z.infer<typeof PreviewNextRunSchema>;
+
 /** 调度三选一：cron / 固定间隔 / 一次性时刻，恰好一个非空。 */
 export function isValidScheduleTriple(input: {
   cron?: string | null;
@@ -135,8 +194,9 @@ export const CreateTaskSchema = z
   .refine((d) => !(d.runAt && (d.endsAt || d.maxRuns || d.overlapPolicy !== "skip")), {
     message: "run-once tasks take no end rules or overlap policy (exactly one run)",
   })
-  .refine((d) => !(d.runAt && (d.startsAt || d.skipHolidays || d.holidayPolicy !== "drop")), {
-    message: "run-once tasks take no startsAt or holiday rules (exactly one run)",
+  // runAt 可配节假日（postpone 顺延 / drop 作废）；startsAt 对单次无意义，继续禁
+  .refine((d) => !(d.runAt && d.startsAt), {
+    message: "run-once tasks take no startsAt (exactly one run)",
   })
   .refine((d) => d.holidayPolicy === "drop" || d.skipHolidays, {
     message: "holidayPolicy requires skipHolidays=true",
@@ -209,7 +269,8 @@ export const UpdateTaskSchema = z
   )
   .refine(
     (d) => {
-      // 同包携带 runAt + 结束规则/重叠策略 → 直接拒绝；单独出现由 service 按既有调度校验
+      // 同包携带 runAt + 结束规则/重叠策略/开始时刻 → 直接拒绝；节假日允许（单次顺延/作废）；
+      // 单独出现由 service 按既有调度校验
       const hasRunAt = "runAt" in d && !!d.runAt;
       if (!hasRunAt) {
         return true;
@@ -218,12 +279,10 @@ export const UpdateTaskSchema = z
       const hasMaxRuns = "maxRuns" in d && !!d.maxRuns;
       const hasOverlap = "overlapPolicy" in d && !!d.overlapPolicy;
       const hasStartsAt = "startsAt" in d && !!d.startsAt;
-      const hasHolidays =
-        ("skipHolidays" in d && !!d.skipHolidays) || ("holidayPolicy" in d && !!d.holidayPolicy);
-      return !(hasEndsAt || hasMaxRuns || hasOverlap || hasStartsAt || hasHolidays);
+      return !(hasEndsAt || hasMaxRuns || hasOverlap || hasStartsAt);
     },
     {
-      message: "run-once tasks take no end rules, startsAt, holiday rules or overlap policy",
+      message: "run-once tasks take no end rules, startsAt or overlap policy",
     },
   )
   .refine(

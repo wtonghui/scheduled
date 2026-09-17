@@ -40,6 +40,12 @@ interface TaskDetail {
   webhookUrl: string | null;
   systemUserId?: string | null;
   nextRunAt: string | null;
+  /** 服务端测算的下一次运行（列表接口为 null；测算失败也为 null，此时回退 nextRunAt）。 */
+  upcoming: {
+    scheduledAt: string | null;
+    holidayAdjusted: boolean;
+    stoppedReason: string | null;
+  } | null;
   version: number;
   writable: boolean;
 }
@@ -170,6 +176,22 @@ export default function TaskDetailPage() {
   const scheduleText = task.runAt
     ? `仅一次 ${new Date(task.runAt).toLocaleString()}`
     : (task.cron ?? (task.scheduleIntervalSeconds ? `每 ${task.scheduleIntervalSeconds} 秒` : "—"));
+  // 服务端测算优先（含节假日/起止/配额），失败或缺失回退存储值；已结束则附原因
+  const stoppedSuffix =
+    task.upcoming && !task.upcoming.scheduledAt && task.upcoming.stoppedReason === "maxRuns"
+      ? "（次数已用完）"
+      : task.upcoming && !task.upcoming.scheduledAt && task.upcoming.stoppedReason === "endsAt"
+        ? "（已过截止）"
+        : task.upcoming && !task.upcoming.scheduledAt && task.upcoming.stoppedReason
+          ? "（无后续计划）"
+          : "";
+  const nextRunText = `${
+    task.upcoming?.scheduledAt
+      ? new Date(task.upcoming.scheduledAt).toLocaleString()
+      : task.nextRunAt
+        ? new Date(task.nextRunAt).toLocaleString()
+        : "—"
+  }${stoppedSuffix}`;
   const metaItems: Array<[string, React.ReactNode]> = [
     ["标识", <code key="id">{task.id}</code>],
     ["类型", task.taskType],
@@ -177,7 +199,12 @@ export default function TaskDetailPage() {
     ...(task.cron ? [["时区", task.timezone] as [string, React.ReactNode]] : []),
     [
       "下次运行",
-      <code key="next">{task.nextRunAt ? new Date(task.nextRunAt).toLocaleString() : "—"}</code>,
+      <code key="next">
+        {nextRunText}
+        {task.upcoming?.holidayAdjusted ? (
+          <span className="ml-1 text-[11px] text-text-muted">（节假日调整）</span>
+        ) : null}
+      </code>,
     ],
     ["重试上限", String(task.maxAttempts)],
     ["重试等待", task.retryDelayMs != null ? `${task.retryDelayMs}ms` : "默认退避"],

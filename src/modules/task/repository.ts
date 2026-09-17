@@ -18,6 +18,7 @@ const TASK_SELECT = {
   overlapPolicy: true,
   endsAt: true,
   maxRuns: true,
+  consumedRuns: true,
   startsAt: true,
   skipHolidays: true,
   holidayPolicy: true,

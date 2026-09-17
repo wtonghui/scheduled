@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { createPool } from "../src/lib/concurrency";
 import { computeNextRun } from "../src/lib/cron";
@@ -345,8 +346,11 @@ export async function claimDueItems(
       }
       handled.add(plan.row.id);
       if (plan.action === "disable") {
+        // 停用条件写时重验（READ 快照可能已过期：用户放宽 endsAt/maxRuns 后谓词不成立则 0 行跳过，下轮正常领取）
         await tx.$executeRaw(
-          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${plan.row.id} AND next_run_at = ${plan.tick}`,
+          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${plan.row.id} AND next_run_at = ${plan.tick}
+            AND ((max_runs IS NOT NULL AND consumed_runs >= max_runs)
+              OR (ends_at IS NOT NULL AND ${plan.tick} > ends_at))`,
         );
         continue;
       }
@@ -371,13 +375,17 @@ export async function claimDueItems(
       }
       handled.add(row.id);
       if (plan.action === "disable") {
+        // 同上：停用条件写时重验，用户放宽配置后 0 行跳过
         await tx.$executeRaw(
-          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id} AND next_run_at = ${tick}`,
+          Prisma.sql`UPDATE task SET next_run_at = NULL, enabled = 0 WHERE id = ${row.id} AND next_run_at = ${tick}
+            AND ((max_runs IS NOT NULL AND consumed_runs >= max_runs)
+              OR (ends_at IS NOT NULL AND ${tick} > ends_at))`,
         );
         continue;
       }
       if (row.overlapPolicy === "run") {
-        // 显式允许并行：无视租约强领（用户自担双跑风险），但仍要 tick guard 防覆盖别人的推进
+        // 显式允许并行：无视租约强领（用户自担双跑风险），但 tick guard + endsAt/maxRuns 谓词仍要：
+        // 读写之间配额被打满时写瞬间驳回（0 行 → settle 定夺停用），配额永不超发
         const claimed = await tx.$executeRaw(
           Prisma.sql`
             UPDATE task
@@ -386,9 +394,12 @@ export async function claimDueItems(
                 next_run_at = ${advanceTo},
                 enabled = ${advanceTo ? 1 : 0}
             WHERE id = ${row.id} AND next_run_at = ${tick}
+              AND (ends_at IS NULL OR ${tick} <= ends_at)
+              AND (max_runs IS NULL OR consumed_runs < max_runs)
           `,
         );
         if (claimed === 0) {
+          failures.push(plan);
           continue;
         }
         items.push({
@@ -398,12 +409,15 @@ export async function claimDueItems(
         });
         continue;
       }
-      // 推进时刻（tick guard 防并发复写），再按策略留痕；超窗则推进到 null 并停用
+      // 推进时刻（tick guard 防并发复写 + endsAt/maxRuns 写时重验；读写之间配额被打满则 0 行 → settle 定夺停用）
       const advanced = await tx.$executeRaw(
         Prisma.sql`UPDATE task SET next_run_at = ${advanceTo}, enabled = ${advanceTo ? 1 : 0}
-          WHERE id = ${row.id} AND next_run_at = ${tick} AND next_run_at <= NOW()`,
+          WHERE id = ${row.id} AND next_run_at = ${tick} AND next_run_at <= NOW()
+            AND (ends_at IS NULL OR ${tick} <= ends_at)
+            AND (max_runs IS NULL OR consumed_runs < max_runs)`,
       );
       if (advanced === 0) {
+        failures.push(plan);
         continue;
       }
       const kind = row.overlapPolicy === "queue" ? "queued" : "skipped";
@@ -517,82 +531,123 @@ export async function claimDueItems(
 }
 
 /**
+ * 对账单 flight 锁（worker_lease 固定行，多实例同时重启只放一个进去）：
+ * 连接无关的原子认领——INSERT 保行存在 + 条件 UPDATE 抢锁（idle 或心跳超 TTL 才可偷），
+ * 崩溃遗留的锁至多 TTL 后被后来者接管；holder 记在 claimed_run_ids，释放只放自己的。
+ */
+const ADVANCE_LOCK_ID = "advance-missed-runs";
+const ADVANCE_LOCK_TTL_SECONDS = 120;
+
+async function tryAcquireAdvanceLock(holder: string): Promise<boolean> {
+  await prisma.$executeRaw`INSERT IGNORE INTO worker_lease (instance_id, last_heartbeat_at, status)
+    VALUES (${ADVANCE_LOCK_ID}, DATE_SUB(NOW(), INTERVAL 1 HOUR), 'idle')`;
+  const claimed = await prisma.$executeRaw`UPDATE worker_lease
+    SET claimed_run_ids = JSON_QUOTE(${holder}), last_heartbeat_at = NOW(), status = 'locked'
+    WHERE instance_id = ${ADVANCE_LOCK_ID}
+      AND (status = 'idle' OR last_heartbeat_at < DATE_SUB(NOW(), INTERVAL ${ADVANCE_LOCK_TTL_SECONDS} SECOND))`;
+  return claimed === 1;
+}
+
+async function releaseAdvanceLock(holder: string): Promise<void> {
+  // 注意：JSON_QUOTE() 返回的是 STRING 类型，与 JSON 列直接 = 比较恒为 0（实测），
+  // 必须用 JSON_UNQUOTE(列) = 明文（MySQL/MariaDB 通用；CAST AS JSON 在 MariaDB 不支持）。
+  await prisma.$executeRaw`UPDATE worker_lease SET status = 'idle'
+    WHERE instance_id = ${ADVANCE_LOCK_ID} AND JSON_UNQUOTE(claimed_run_ids) = ${holder}`;
+}
+
+/**
  * 重启对账：停机期间错过的运行不补跑，仅推进到下一未来运行。
  * 有界并发批量推进，避免"停机久 + 任务多"时逐条串行 update 拖慢重启（原 N+1）。
  * 语义不变：`enabled` 只在无未来运行点时置 false。
+ * 并发安全：单 flight（多实例同时重启只一个执行，其余 return 0）+ 所有写带 tick guard，
+ * 停用写额外带条件谓词（写瞬间用最新值重验，防旧快照在用户放宽配置后误停）。
  */
-export async function advanceMissedRuns(now = new Date()): Promise<number> {
-  // 租约有效（上次仍在跑）的任务不在此推进，留给领取环节按 overlapPolicy 处理（跳过审计/排队），
-  // 避免对账把运行中任务的 next_run_at 提前 yank 走
-  const missed = await prisma.task.findMany({
-    where: {
-      enabled: true,
-      nextRunAt: { lte: now },
-      OR: [{ claimedUntil: null }, { claimedUntil: { lt: now } }],
-    },
-    select: {
-      id: true,
-      nextRunAt: true,
-      cron: true,
-      scheduleIntervalSeconds: true,
-      timezone: true,
-      endsAt: true,
-      maxRuns: true,
-      consumedRuns: true,
-      skipHolidays: true,
-      holidayPolicy: true,
-    },
-  });
-  if (missed.length === 0) {
+export async function advanceMissedRuns(now = new Date(), holderId?: string): Promise<number> {
+  const holder = holderId ?? randomUUID();
+  if (!(await tryAcquireAdvanceLock(holder))) {
+    logger.info("advanceMissedRuns skipped (another instance holds the lock)");
     return 0;
   }
-  const pool = createPool(16);
-  await Promise.all(
-    missed.map((task) =>
-      pool.run(async () => {
-        // maxRuns 用尽 → 直接停用（读 consumedRuns 列，不数全表；归档不影响）。
-        if (task.maxRuns != null && Number(task.consumedRuns ?? 0) >= Number(task.maxRuns)) {
-          await prisma.task.update({
-            where: { id: task.id },
-            data: { nextRunAt: null, enabled: false },
-          });
-          return;
-        }
-        // endsAt：本轮 tick 仍在窗口内 → 不动，留给领取循环执行（避免对账提前停用丢 tick）；
-        // tick 已超窗 → 停用。
-        if (task.endsAt) {
-          const tickTime = task.nextRunAt?.getTime();
-          if (tickTime == null || tickTime <= task.endsAt.getTime()) {
+  try {
+    // 租约有效（上次仍在跑）的任务不在此推进，留给领取环节按 overlapPolicy 处理（跳过审计/排队），
+    // 避免对账把运行中任务的 next_run_at 提前 yank 走
+    const missed = await prisma.task.findMany({
+      where: {
+        enabled: true,
+        nextRunAt: { lte: now },
+        OR: [{ claimedUntil: null }, { claimedUntil: { lt: now } }],
+      },
+      select: {
+        id: true,
+        nextRunAt: true,
+        cron: true,
+        scheduleIntervalSeconds: true,
+        timezone: true,
+        endsAt: true,
+        maxRuns: true,
+        consumedRuns: true,
+        skipHolidays: true,
+        holidayPolicy: true,
+      },
+    });
+    if (missed.length === 0) {
+      return 0;
+    }
+    const pool = createPool(16);
+    await Promise.all(
+      missed.map((task) =>
+        pool.run(async () => {
+          const tick = task.nextRunAt;
+          if (!tick) {
             return;
           }
-          await prisma.task.update({
-            where: { id: task.id },
-            data: { nextRunAt: null, enabled: false },
+          // maxRuns 用尽 → 直接停用（读 consumedRuns 列，不数全表；归档不影响）。
+          // 写时重验：快照过期（用户放宽 maxRuns）或 tick 已被推进则 0 行跳过。
+          if (task.maxRuns != null && Number(task.consumedRuns ?? 0) >= Number(task.maxRuns)) {
+            await prisma.$executeRaw`UPDATE task SET next_run_at = NULL, enabled = 0
+              WHERE id = ${task.id} AND next_run_at = ${tick}
+                AND max_runs IS NOT NULL AND consumed_runs >= max_runs`;
+            return;
+          }
+          // endsAt：本轮 tick 仍在窗口内 → 不动，留给领取循环执行（避免对账提前停用丢 tick）；
+          // tick 已超窗 → 停用（写时重验，用户延长 endsAt 后 0 行跳过）。
+          if (task.endsAt) {
+            const tickTime = tick.getTime();
+            if (tickTime <= task.endsAt.getTime()) {
+              return;
+            }
+            await prisma.$executeRaw`UPDATE task SET next_run_at = NULL, enabled = 0
+              WHERE id = ${task.id} AND next_run_at = ${tick}
+                AND ends_at IS NOT NULL AND ${tick} > ends_at`;
+            return;
+          }
+          const rawNext = computeNextRun(
+            { cron: task.cron, scheduleIntervalSeconds: task.scheduleIntervalSeconds },
+            now,
+            task.timezone,
+          );
+          const next = await applyTaskHolidays(rawNext, task);
+          // 到此 maxRuns/endsAt 已处理（上早退），只剩无下次 → 停用（tick guard 防盖住领取循环的推进）
+          if (!next) {
+            await prisma.task.updateMany({
+              where: { id: task.id, nextRunAt: tick },
+              data: { nextRunAt: null, enabled: false },
+            });
+            return;
+          }
+          await prisma.task.updateMany({
+            where: { id: task.id, nextRunAt: tick },
+            data: { nextRunAt: next },
           });
-          return;
-        }
-        const rawNext = computeNextRun(
-          { cron: task.cron, scheduleIntervalSeconds: task.scheduleIntervalSeconds },
-          now,
-          task.timezone,
-        );
-        const next = await applyTaskHolidays(rawNext, task);
-        // 到此 maxRuns/endsAt 已处理（上早退），只剩无下次 → 停用
-        if (!next) {
-          await prisma.task.update({
-            where: { id: task.id },
-            data: { nextRunAt: null, enabled: false },
-          });
-          return;
-        }
-        await prisma.task.update({
-          where: { id: task.id },
-          data: { nextRunAt: next, ...(next ? {} : { enabled: false }) },
-        });
-      }),
-    ),
-  );
-  return missed.length;
+        }),
+      ),
+    );
+    return missed.length;
+  } finally {
+    await releaseAdvanceLock(holder).catch((error) => {
+      logger.warn({ err: (error as Error).message }, "release advance lock failed");
+    });
+  }
 }
 
 /** 租约回收（T038）：清扫 claimed_until < now 的孤儿领取。 */

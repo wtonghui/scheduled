@@ -9,6 +9,7 @@ import type { Prisma } from "@prisma/client";
 import {
   CreateTaskSchema,
   type HttpPayload,
+  PreviewNextRunSchema,
   UpdateTaskSchema,
   validatePayloadForType,
 } from "./dto";
@@ -39,6 +40,7 @@ type TaskRow = Prisma.TaskGetPayload<{
     overlapPolicy: true;
     endsAt: true;
     maxRuns: true;
+    consumedRuns: true;
     startsAt: true;
     skipHolidays: true;
     holidayPolicy: true;
@@ -100,6 +102,11 @@ export interface TaskView {
   emailAttachmentUrlTemplate: string | null;
   systemUserId?: string | null;
   nextRunAt: Date | null;
+  /**
+   * 服务端测算的下一次运行（含节假日/起止/配额；interval 为估算）。
+   * 仅单行接口（详情/创建/更新）填充，列表为 null；计算失败也为 null（前端回退 nextRunAt）。
+   */
+  upcoming: UpcomingInfo | null;
   version: number;
   createdAt: Date;
   updatedAt: Date;
@@ -115,8 +122,9 @@ export interface TaskView {
  * 首跑时刻：startsAt 之前不触发。
  * cron → 从 max(now, startsAt) 起算第一个命中点；
  * interval → startsAt 在未来则首跑即 startsAt，否则 now+N（顺延）。
+ * 预览接口复用同一函数（导出去），保证“预览的时间”和“实际跑的时间”同一口径。
  */
-function resolveFirstRun(
+export function resolveFirstRun(
   schedule: { cron?: string | null; scheduleIntervalSeconds?: number | null },
   startsAt: Date | null,
   timezone: string,
@@ -130,6 +138,210 @@ function resolveFirstRun(
     return new Date(now.getTime() + schedule.scheduleIntervalSeconds * 1000);
   }
   return computeNextRun(schedule, ref, timezone);
+}
+
+/** 单次预览行：计划时刻 + 是否被节假日调整过（drop 跳过中间 tick 只体现在时间差上）。 */
+export interface UpcomingRun {
+  scheduledAt: Date;
+  holidayAdjusted: boolean;
+}
+
+/** 预览终止原因：endsAt=下一次已超截止；maxRuns=配额已用尽（读 consumedRuns）；no-future-schedule=调度本身无未来时间。还有后续则为 null（runs 非空时也可同时带 stopped，表示“这几 run 完即止”）。 */
+export type UpcomingStopReason = "endsAt" | "maxRuns" | "no-future-schedule";
+
+/** 详情 enrichment：scheduledAt 为 null 时看 stoppedReason；计算失败则整体为 null（前端回退存储值）。 */
+export interface UpcomingInfo {
+  scheduledAt: Date | null;
+  holidayAdjusted: boolean;
+  stoppedReason: UpcomingStopReason | null;
+}
+
+export interface UpcomingSpec {
+  cron: string | null;
+  scheduleIntervalSeconds: number | null;
+  timezone: string;
+  startsAt: Date | null;
+  endsAt: Date | null;
+  maxRuns: number | null;
+  consumedRuns: number;
+  skipHolidays: boolean;
+  holidayPolicy: string;
+}
+
+/**
+ * 下次运行预览（纯函数，不碰库）：与 claim 同语义（resolveFirstRun 起算、节假日调整、
+ * maxRuns/endsAt 终止），供详情 enrichment 与 preview-spec 接口共用。
+ * overlap/maxAttempts/重试不考虑（执行层的事，不影响到点时刻）；interval 是估算
+ * （假设在 cursor 时刻跑完，与 claim 从认领时刻起算同口径）。
+ */
+export async function computeUpcomingRuns(
+  spec: UpcomingSpec,
+  opts: {
+    from?: Date;
+    count?: number;
+    /** 测试注入；默认走真实 isHoliday（含 24h 缓存）。 */
+    isHolidayFn?: (naturalDay: string) => Promise<boolean | null>;
+  } = {},
+): Promise<{ runs: UpcomingRun[]; stopped: UpcomingStopReason | null }> {
+  const count = Math.min(10, Math.max(1, Math.floor(opts.count ?? 1) || 1));
+  const from = opts.from ?? new Date();
+  const schedule = { cron: spec.cron, scheduleIntervalSeconds: spec.scheduleIntervalSeconds };
+  const runs: UpcomingRun[] = [];
+  let cursor = from;
+  for (let i = 0; i < count; i += 1) {
+    const raw = resolveFirstRun(schedule, spec.startsAt, spec.timezone, cursor);
+    if (!raw) {
+      return { runs, stopped: "no-future-schedule" };
+    }
+    const adjusted = spec.skipHolidays
+      ? await adjustForHolidays({
+          candidate: raw,
+          policy: spec.holidayPolicy as HolidayPolicy,
+          timezone: spec.timezone,
+          nextAfter: (d) => computeNextRun(schedule, d, spec.timezone),
+          ...(opts.isHolidayFn ? { isHolidayFn: opts.isHolidayFn } : {}),
+        })
+      : raw;
+    if (!adjusted) {
+      return { runs, stopped: "no-future-schedule" };
+    }
+    if (
+      spec.maxRuns != null &&
+      Number(spec.consumedRuns ?? 0) + runs.length >= Number(spec.maxRuns)
+    ) {
+      return { runs, stopped: "maxRuns" };
+    }
+    if (spec.endsAt && adjusted.getTime() > spec.endsAt.getTime()) {
+      return { runs, stopped: "endsAt" };
+    }
+    runs.push({
+      scheduledAt: adjusted,
+      holidayAdjusted: adjusted.getTime() !== raw.getTime(),
+    });
+    cursor = adjusted;
+  }
+  return { runs, stopped: null };
+}
+
+/**
+ * 未保存配置的预览（创建/编辑表单用）：cron / interval / runAt 三选一，与创建同口径；
+ * skipHolidays 要求节假日 API 已配置（否则预览显示“无调整”会误导，与创建同规则）。
+ * runAt 走单发分支（一条命，跑完即止恒为 stopped）；核心循环只做重复。
+ */
+export async function previewSpecNextRuns(
+  input: unknown,
+  opts: {
+    /** 测试注入；默认走真实 isHoliday（含 24h 缓存）。 */
+    isHolidayFn?: (naturalDay: string) => Promise<boolean | null>;
+  } = {},
+): Promise<{
+  runs: UpcomingRun[];
+  stopped: UpcomingStopReason | null;
+}> {
+  const parsed = PreviewNextRunSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new AppError(
+      400,
+      "VALIDATION",
+      "invalid preview input",
+      parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`),
+    );
+  }
+  const d = parsed.data;
+  // 注入假日函数时跳过“已配置”检查：注入源即数据源（单测/未来调用方），路由永不注入，生产行为不变
+  if (d.skipHolidays && !opts.isHolidayFn && !isHolidayConfigured()) {
+    throw new AppError(400, "VALIDATION", "holiday API not configured (HOLIDAY_API_URL/APP_KEY)");
+  }
+  const from = d.from ? new Date(d.from) : new Date();
+  if (d.runAt) {
+    const at = new Date(d.runAt);
+    if (at.getTime() <= from.getTime()) {
+      return { runs: [], stopped: "no-future-schedule" };
+    }
+    if (d.skipHolidays) {
+      const adjusted = await adjustForHolidays({
+        candidate: at,
+        policy: d.holidayPolicy as HolidayPolicy,
+        timezone: d.timezone ?? DEFAULT_TIMEZONE,
+        // 一次性无“下一次”：drop 撞假日即作废（creation 侧对应 400，這里返回 stopped 告知）
+        nextAfter: () => null,
+        ...(opts.isHolidayFn ? { isHolidayFn: opts.isHolidayFn } : {}),
+      });
+      if (!adjusted) {
+        return { runs: [], stopped: "no-future-schedule" };
+      }
+      return {
+        runs: [{ scheduledAt: adjusted, holidayAdjusted: adjusted.getTime() !== at.getTime() }],
+        stopped: "no-future-schedule",
+      };
+    }
+    return { runs: [{ scheduledAt: at, holidayAdjusted: false }], stopped: "no-future-schedule" };
+  }
+  return computeUpcomingRuns(
+    {
+      cron: d.cron ?? null,
+      scheduleIntervalSeconds: d.scheduleIntervalSeconds ?? null,
+      timezone: d.timezone ?? DEFAULT_TIMEZONE,
+      startsAt: d.startsAt ? new Date(d.startsAt) : null,
+      endsAt: d.endsAt ? new Date(d.endsAt) : null,
+      maxRuns: d.maxRuns ?? null,
+      consumedRuns: 0,
+      skipHolidays: d.skipHolidays,
+      holidayPolicy: d.holidayPolicy,
+    },
+    { from: d.from ? new Date(d.from) : undefined, count: d.count, ...(opts.isHolidayFn ? { isHolidayFn: opts.isHolidayFn } : {}) },
+  );
+}
+
+/**
+ * 详情 enrichment（永不抛错）：一次性任务无节假日/结束规则，直接镜像存储值；
+ * 重复任务算一次（count=1）；任何异常回 null，前端回退存储 nextRunAt 显示。
+ */
+async function safeUpcomingForRow(row: {
+  cron: string | null;
+  scheduleIntervalSeconds: number | null;
+  timezone: string;
+  startsAt: Date | null;
+  endsAt: Date | null;
+  maxRuns: number | null;
+  consumedRuns: number | null;
+  skipHolidays: boolean;
+  holidayPolicy: string;
+  nextRunAt: Date | null;
+}): Promise<UpcomingInfo | null> {
+  try {
+    if (!row.cron && row.scheduleIntervalSeconds == null) {
+      const at = row.nextRunAt;
+      return {
+        scheduledAt: at,
+        holidayAdjusted: false,
+        stoppedReason: at ? null : "no-future-schedule",
+      };
+    }
+    const { runs, stopped } = await computeUpcomingRuns(
+      {
+        cron: row.cron,
+        scheduleIntervalSeconds: row.scheduleIntervalSeconds,
+        timezone: row.timezone,
+        startsAt: row.startsAt,
+        endsAt: row.endsAt,
+        maxRuns: row.maxRuns,
+        consumedRuns: Number(row.consumedRuns ?? 0),
+        skipHolidays: row.skipHolidays,
+        holidayPolicy: row.holidayPolicy,
+      },
+      { from: new Date(), count: 1 },
+    );
+    const first = runs[0] ?? null;
+    return {
+      scheduledAt: first?.scheduledAt ?? null,
+      holidayAdjusted: first?.holidayAdjusted ?? false,
+      stoppedReason: first ? null : stopped,
+    };
+  } catch (error) {
+    logger.warn({ err: (error as Error).message }, "upcoming preview failed, falling back to stored nextRunAt");
+    return null;
+  }
 }
 
 /** 假日调整（skipHolidays=false 直接返回原值，零开销）。 */
@@ -176,7 +388,7 @@ function splitPayload(
   return { publicPayload: { url, method }, secretBytes };
 }
 
-function toView(row: TaskRow): TaskView {
+function toView(row: TaskRow, upcoming: UpcomingInfo | null = null): TaskView {
   let payload = row.payload as Record<string, unknown>;
   if (row.payloadSecrets) {
     const secrets = decryptJson(row.payloadSecrets) as Record<string, unknown>;
@@ -209,6 +421,7 @@ function toView(row: TaskRow): TaskView {
     emailAttachmentUrlTemplate: row.emailAttachmentUrlTemplate,
     systemUserId: (row as any).systemUserId ?? null,
     nextRunAt: row.nextRunAt,
+    upcoming,
     version: row.version,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -251,7 +464,7 @@ export async function list(tenantId: string, query: TaskListQuery) {
     systemUserId: query.systemUserId,
   });
   return {
-    data: rows.map(toView),
+    data: rows.map((row) => toView(row)),
     meta: { page, pageSize, total },
   };
 }
@@ -284,7 +497,7 @@ export async function get(tenantId: string, id: string): Promise<TaskView> {
   if (!row) {
     throw new AppError(404, "NOT_FOUND", "task not found");
   }
-  return toView(row);
+  return { ...toView(row), upcoming: await safeUpcomingForRow(row) };
 }
 
 /**
@@ -296,7 +509,7 @@ export async function getAny(id: string, viewerTenantId: string | null): Promise
   if (!row) {
     throw new AppError(404, "NOT_FOUND", "task not found");
   }
-  return toViewAll(row, viewerTenantId);
+  return { ...toViewAll(row, viewerTenantId), upcoming: await safeUpcomingForRow(row) };
 }
 
 export async function create(
@@ -382,7 +595,7 @@ export async function create(
       data.taskType === "http" ? new Uint8Array(encryptSecret(generateWebhookSecret())) : null,
     nextRunAt,
   });
-  return toView(row);
+  return { ...toView(row), upcoming: await safeUpcomingForRow(row) };
 }
 
 export async function update(tenantId: string, id: string, input: unknown): Promise<TaskView> {
@@ -604,7 +817,7 @@ export async function update(tenantId: string, id: string, input: unknown): Prom
   if (!row) {
     throw new AppError(404, "NOT_FOUND", "task not found");
   }
-  return toView(row);
+  return { ...toView(row), upcoming: await safeUpcomingForRow(row) };
 }
 
 export async function remove(tenantId: string, id: string): Promise<void> {

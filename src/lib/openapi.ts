@@ -242,6 +242,16 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/v1/tasks/preview-next-run",
+  summary: "Preview upcoming runs for an unsaved schedule (cron/interval/runAt, tasks:read)",
+  tags: ["tasks"],
+  responses: {
+    200: { description: "runs", content: { "application/json": { schema: SuccessAny } } },
+  },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/v1/tasks/{id}/executions",
   summary: "Task execution history",

@@ -7,11 +7,15 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { ApiClientError } from "@/lib/api-client";
+import { ApiClientError, api } from "@/lib/api-client";
 import { DateTime } from "luxon";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
-import ScheduleBuilder, { type ScheduleResult } from "./ScheduleBuilder";
+import { useEffect, useRef, useState } from "react";
+import ScheduleBuilder, {
+  type ScheduleResult,
+  type ServerPreview,
+  stoppedLabel,
+} from "./ScheduleBuilder";
 
 /**
  * 任务创建/编辑共用的表单组件。
@@ -202,6 +206,102 @@ export default function TaskForm({
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
+  /** 服务端测算预览（未来 3 次，含节假日/起止/配额；失败静默不打扰填表；透传给 ScheduleBuilder 行内展示）。 */
+  const [serverPreview, setServerPreview] = useState<ServerPreview | null>(null);
+  const previewSeq = useRef(0);
+  useEffect(() => {
+    const seq = previewSeq.current + 1;
+    previewSeq.current = seq;
+    const timer = setTimeout(() => {
+      void (async () => {
+        let body: Record<string, unknown> | null = null;
+        if (scheduleKind === "once") {
+          // 一次性：没开假日不调（输入框即答案）；开了才测算顺延/作废
+          if (!skipHolidays) {
+            setServerPreview(null);
+            return;
+          }
+          if (!runAtLocal) {
+            setServerPreview(null);
+            return;
+          }
+          const dt = DateTime.fromFormat(runAtLocal, "yyyy-MM-dd'T'HH:mm", { zone: timezone });
+          if (!dt.isValid) {
+            setServerPreview(null);
+            return;
+          }
+          body = {
+            runAt: dt.toUTC().toISO() ?? undefined,
+            timezone,
+            skipHolidays: true,
+            holidayPolicy,
+            count: 1,
+          };
+        } else if (scheduleKind === "cron") {
+          if (!schedule.cron) {
+            setServerPreview(null);
+            return;
+          }
+          body = { cron: schedule.cron, timezone };
+        } else {
+          const interval = schedule.scheduleIntervalSeconds ?? intervalSeconds;
+          if (!interval || interval < 1) {
+            setServerPreview(null);
+            return;
+          }
+          body = { scheduleIntervalSeconds: interval };
+        }
+        const toIso = (local: string): string | undefined => {
+          if (!local) return undefined;
+          const dt = DateTime.fromFormat(local, "yyyy-MM-dd'T'HH:mm", { zone: timezone });
+          return dt.isValid ? (dt.toUTC().toISO() ?? undefined) : undefined;
+        };
+        const startsAtIso = toIso(startsAtLocal);
+        const endsAtIso = toIso(endsAtLocal);
+        if ((startsAtLocal && !startsAtIso) || (endsAtLocal && !endsAtIso)) {
+          setServerPreview(null);
+          return;
+        }
+        const maxRunsNum = maxRuns.trim() ? Number(maxRuns) : undefined;
+        if (maxRunsNum !== undefined && (!Number.isInteger(maxRunsNum) || maxRunsNum < 1)) {
+          setServerPreview(null);
+          return;
+        }
+        try {
+          const res = await api.post<ServerPreview>("/api/v1/tasks/preview-next-run", {
+            ...body,
+            ...(startsAtIso ? { startsAt: startsAtIso } : {}),
+            ...(endsAtIso ? { endsAt: endsAtIso } : {}),
+            ...(maxRunsNum !== undefined ? { maxRuns: maxRunsNum } : {}),
+            skipHolidays,
+            ...(skipHolidays ? { holidayPolicy } : {}),
+            count: 3,
+          });
+          if (previewSeq.current === seq) {
+            setServerPreview(res.data);
+          }
+        } catch {
+          // 预览失败（未登录/400/网络）静默：提交时自有校验，不打扰填表
+          if (previewSeq.current === seq) {
+            setServerPreview(null);
+          }
+        }
+      })();
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [
+    schedule,
+    scheduleKind,
+    runAtLocal,
+    intervalSeconds,
+    timezone,
+    startsAtLocal,
+    endsAtLocal,
+    maxRuns,
+    skipHolidays,
+    holidayPolicy,
+  ]);
+
   const set = <K extends keyof typeof form>(key: K, value: (typeof form)[K]) =>
     setForm((f) => ({ ...f, [key]: value }));
 
@@ -304,8 +404,8 @@ export default function TaskForm({
       endsAt: endsAtIso,
       maxRuns: maxRunsNum,
       startsAt: startsAtIso,
-      skipHolidays: scheduleKind === "once" ? undefined : skipHolidays || undefined,
-      holidayPolicy: scheduleKind === "once" || !skipHolidays ? undefined : holidayPolicy,
+      skipHolidays: skipHolidays || undefined,
+      holidayPolicy: !skipHolidays ? undefined : holidayPolicy,
       emailSubjectTemplate: emailSubjectTemplate.trim() || undefined,
       emailBodyTemplate: emailBodyTemplate.trim() || undefined,
       emailAttachmentUrlTemplate: emailAttachmentUrlTemplate.trim() || undefined,
@@ -413,6 +513,30 @@ export default function TaskForm({
                   onChange={(e) => setRunAtLocal(e.target.value)}
                   className="mt-1.5"
                 />
+                <div className="mt-4 flex items-center gap-2">
+                  <Switch
+                    id="task-run-at-skip-holidays"
+                    checked={skipHolidays}
+                    onCheckedChange={setSkipHolidays}
+                  />
+                  <Label htmlFor="task-run-at-skip-holidays" className="cursor-pointer text-[13px]">
+                    遇节假日顺延（按所选时区查日历；作废请直接改时间）
+                  </Label>
+                </div>
+                {skipHolidays && (
+                  <div className="mt-4">
+                    <Label>节假日策略</Label>
+                    <Select
+                      value={holidayPolicy}
+                      onValueChange={setHolidayPolicy}
+                      className="mt-1.5"
+                      options={[
+                        { value: "drop", label: "作废（到时不跑）" },
+                        { value: "postpone", label: "顺延到下一工作日" },
+                      ]}
+                    />
+                  </div>
+                )}
               </div>
             ) : (
               <ScheduleBuilder
@@ -420,6 +544,7 @@ export default function TaskForm({
                 defaultValue={
                   mode === "edit" && schedule.cron ? { cron: schedule.cron } : undefined
                 }
+                serverPreview={serverPreview}
               />
             )}
           </div>
@@ -523,6 +648,23 @@ export default function TaskForm({
                 </div>
               )}
             </>
+          )}
+
+          {scheduleKind !== "once" && serverPreview && serverPreview.runs.length > 0 && (
+            <div className="mt-4 max-w-72 rounded-md border border-line px-3 py-2 text-[12px] text-text-muted">
+              <div className="mb-1 font-medium text-text">
+                服务端测算（未来{serverPreview.runs.length}次，含节假日/起止）
+              </div>
+              {serverPreview.runs.map((r) => (
+                <div key={r.scheduledAt}>
+                  <code>{new Date(r.scheduledAt).toLocaleString()}</code>
+                  {r.holidayAdjusted ? <span>（节假日调整）</span> : null}
+                </div>
+              ))}
+              {serverPreview.stopped ? (
+                <div>之后无计划{stoppedLabel(serverPreview.stopped)}</div>
+              ) : null}
+            </div>
           )}
 
           <div className="mt-4">

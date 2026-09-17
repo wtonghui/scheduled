@@ -36,12 +36,28 @@ export interface ScheduleResult {
   scheduleIntervalSeconds?: number;
 }
 
+/** 服务端测算预览（父表单统一拉取后透传，避免两处各调一次）。 */
+export interface ServerPreview {
+  runs: { scheduledAt: string; holidayAdjusted: boolean }[];
+  stopped: string | null;
+}
+
+/** stopped 原因文案（表单两处共用）。 */
+export function stoppedLabel(stopped: string | null): string {
+  if (stopped === "maxRuns") return "（次数已用完）";
+  if (stopped === "endsAt") return "（已过截止）";
+  if (stopped) return "（无后续计划）";
+  return "";
+}
+
 interface Props {
   onChange: (result: ScheduleResult) => void;
   defaultValue?: ScheduleResult;
+  /** 服务端测算（有则优先展示，无则回退本地 cron 推导）。 */
+  serverPreview?: ServerPreview | null;
 }
 
-export default function ScheduleBuilder({ onChange, defaultValue }: Props) {
+export default function ScheduleBuilder({ onChange, defaultValue, serverPreview }: Props) {
   /**
    * 编辑回填：cron 能映射回结构化 → 以该 spec 为初始值，
    * 「回到结构化选择」即对应到原重复方式/时间；否则保持默认。
@@ -311,7 +327,18 @@ export default function ScheduleBuilder({ onChange, defaultValue }: Props) {
             </div>
             <div className="flex items-center gap-2">
               <Badge tone="neutral">下次运行</Badge>
-              {next ? (
+              {serverPreview?.runs[0] ? (
+                <>
+                  <code className="text-xs">
+                    {new Date(serverPreview.runs[0].scheduledAt).toLocaleString()}
+                  </code>
+                  {serverPreview.runs[0].holidayAdjusted ? (
+                    <span className="text-[12px] text-text-muted">（节假日调整）</span>
+                  ) : null}
+                </>
+              ) : serverPreview ? (
+                <span className="text-text-faint">—{stoppedLabel(serverPreview.stopped)}</span>
+              ) : next ? (
                 <>
                   <code className="text-xs">{next.toLocaleString()}</code>
                   <span className="text-[12px] text-text-muted">

@@ -97,7 +97,7 @@
 "runAt": "2026-09-01T10:00:00Z"    // 过去时刻，400
 ```
 
-**注意**：跑完自动 enabled=false 停用；禁止配 endsAt/maxRuns/overlapPolicy/startsAt/skipHolidays/holidayPolicy。
+**注意**：跑完自动 enabled=false 停用；禁止配 endsAt/maxRuns/overlapPolicy/startsAt；可配 skipHolidays/holidayPolicy（撞假日 postpone 顺延、drop 作废即创建 400）。
 
 ---
 
@@ -635,7 +635,7 @@ X-Trigger-Type: 1
 | startsAt must be in the future | startsAt 是过去时刻 |
 | timezone is only meaningful with cron or runAt | interval 调度同时传了 timezone |
 | unknown IANA timezone | timezone 不是合法 IANA 时区名 |
-| run-once tasks take no end rules, startsAt, holiday rules or overlap policy | runAt 任务传了重复调度专属参数 |
+| run-once tasks take no end rules, startsAt or overlap policy | runAt 任务传了 endsAt/maxRuns/startsAt/overlapPolicy（节假日除外，可配） |
 | holidayPolicy requires skipHolidays=true | holidayPolicy 非 drop 但没开 skipHolidays |
 | at least one recipient | recipients 为空数组 |
 | invalid recipient email | recipients 中有非邮箱格式 |

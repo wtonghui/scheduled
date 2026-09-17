@@ -208,14 +208,14 @@ describe("UpdateTaskSchema schedule fields", () => {
     ).toBe(false);
   });
 
-  it("rejects holiday rules with runAt, policy-without-skip", () => {
+  it("allows holiday rules with runAt, still rejects policy-without-skip", () => {
     expect(
       CreateTaskSchema.safeParse({
         ...baseCreate,
         runAt: "2099-01-01T09:00:00+08:00",
         skipHolidays: true,
       }).success,
-    ).toBe(false);
+    ).toBe(true);
     expect(
       CreateTaskSchema.safeParse({
         ...baseCreate,
@@ -241,5 +241,16 @@ describe("UpdateTaskSchema schedule fields", () => {
         version: 1,
       }).success,
     ).toBe(false);
+  });
+
+  it("accepts runAt + holidays in the same patch", () => {
+    expect(
+      UpdateTaskSchema.safeParse({
+        runAt: "2099-01-01T09:00:00+08:00",
+        skipHolidays: true,
+        holidayPolicy: "postpone",
+        version: 1,
+      }).success,
+    ).toBe(true);
   });
 });

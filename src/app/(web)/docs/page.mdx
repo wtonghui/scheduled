@@ -105,6 +105,7 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | 任务 | <Method method="PATCH" /> | `/api/v1/tasks/:id` | `tasks:write` |
 | 任务 | <Method method="DELETE" /> | `/api/v1/tasks/:id` | `tasks:write` |
 | 任务 | <Method method="POST" /> | `/api/v1/tasks/:id/run-now` | `tasks:write` |
+| 任务 | <Method method="POST" /> | `/api/v1/tasks/preview-next-run` | `tasks:read` |
 | 任务 | <Method method="GET" /> | `/api/v1/tasks/:id/sign-secrets` | 任意有效 token |
 | 任务 | <Method method="POST" /> | `/api/v1/tasks/:id/sign-secrets/rotate` | 任意有效 token |
 | 结果 | <Method method="GET" /> | `/api/v1/tasks/:id/executions` | 匿名可读 |
@@ -151,7 +152,8 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `emailSubjectTemplate` | string \| null | 邮件标题模板（`{placeholder}` 渲染） |
 | `emailBodyTemplate` | string \| null | 邮件正文模板 |
 | `emailAttachmentUrlTemplate` | string \| null | 附件 URL 模板 |
-| `nextRunAt` | string \| null | 下次触发时间 |
+| `nextRunAt` | string \| null | 下次触发时间（存储值；详情页“下次运行”优先展示下面的服务端测算） |
+| `upcoming` | object \| null | 服务端测算的下一次运行（含节假日/起止/配额；仅详情/创建/更新返回，列表为 null）：`scheduledAt`（string\|null）、`holidayAdjusted`（boolean）、`stoppedReason`（`endsAt`/`maxRuns`/`no-future-schedule`\|null） |
 | `version` | number | 乐观并发版本号；`PATCH` 必须带当前值，冲突返回 `409` |
 | `createdAt` / `updatedAt` | string | 创建 / 最后修改时间 |
 | `writable` | boolean | 当前查看者是否可写（本租户=true） |
@@ -552,6 +554,60 @@ curl -X POST http://localhost:3000/api/v1/tasks/cmt6yqpo50003m0vispoa9p9h/run-no
 ```
 
 **失败**：`404` / `401` / `403`。
+
+<Endpoint id="ep-tasks-preview-next-run" method="POST" path="/api/v1/tasks/preview-next-run" name="预演下次运行" />
+
+给**未保存**的调度配置算未来运行（创建/编辑表单边填边看用），纯计算不碰库。`cron` / `scheduleIntervalSeconds` / `runAt` 三选一（与创建同口径）；`from`（ISO 带偏移，缺省 now）、`count`（缺省 1，上限 10）；重复调度的 `consumedRuns` 按 0 算。返回 `runs`（`scheduledAt` + `holidayAdjusted`）与 `stopped`（`endsAt` / `maxRuns` / `no-future-schedule`，还有后续则为 null）。一次性只返回至多 1 条（跑完即止恒为 stopped）；`runAt` 可配节假日（顺延/作废），禁 `endsAt` / `maxRuns` / `startsAt`。
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `cron` | string | 三选一 | 5/6/7 段 cron |
+| `scheduleIntervalSeconds` | number | 三选一 | 固定间隔（秒，≥1，从 `from` 起算顺延） |
+| `runAt` | string | 三选一 | 一次性时刻（ISO 带偏移，必须未来；可配节假日，禁起止/配额） |
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `cron` | string | 与 `scheduleIntervalSeconds` 二选一 | 5/6/7 段 cron |
+| `scheduleIntervalSeconds` | number | 二选一 | 固定间隔（秒，≥1，从 `from` 起算顺延） |
+| `timezone` | string | 否 | IANA 时区（默认 `Asia/Shanghai`）；interval 下传了会 400（无钟表概念） |
+| `startsAt` | string \| null | 否 | ISO 带偏移；只验格式不验未来（预览旧配置直接报 stopped） |
+| `endsAt` | string \| null | 否 | ISO 带偏移；命中则 `stopped` 为 `endsAt` |
+| `maxRuns` | number \| null | 否 | 1–1000000；`consumedRuns` 按 0 起算，够数即 `stopped` 为 `maxRuns` |
+| `skipHolidays` | boolean | 否 | 默认 false；true 要求节假日 API 已配置，否则 400 |
+| `holidayPolicy` | string | 否 | `drop`（默认）/ `postpone`；非 drop 必须开 `skipHolidays` |
+| `from` | string | 否 | ISO 带偏移，缺省 now；可传未来/过去（如国庆前一天） |
+| `count` | number | 否 | 缺省 1，上限 10 |
+
+```bash
+curl -X POST http://localhost:3000/api/v1/tasks/preview-next-run \
+  -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt" \
+  -H "Content-Type: application/json" \
+  -d '{"cron":"0 9 * * 1-5","timezone":"Asia/Shanghai","skipHolidays":true,"count":3}'
+```
+
+**成功（200）**：
+
+```json
+{ "success": true, "data": {
+    "runs": [
+      { "scheduledAt": "2026-09-15T09:00:00.000+08:00", "holidayAdjusted": false },
+      { "scheduledAt": "2026-09-16T09:00:00.000+08:00", "holidayAdjusted": false }
+    ],
+    "stopped": null
+} }
+```
+
+`stopped` 非 null 时 `runs` 可能为空（如配额已用尽）；`holidayAdjusted` 为 true 表示该次被节假日调整过（drop 跳过的中间 tick 不展开，只体现在时间差上）。
+
+`stopped` 取值含义（还有后续则为 null；`runs` 非空时也可能同时带 `stopped`，表示“这几 run 完即止”）：
+
+| 取值 | 含义 | 对应调度语义 |
+|------|------|--------------|
+| `endsAt` | 算出的下一次已超过任务截止时刻，之后不再跑 | claim 侧 `tick > endsAt` 不执行直接停用 |
+| `maxRuns` | 按 `consumedRuns` 配额已用尽，再跑一次即超 | claim 侧配额谓词；归档不影响计数，永不复活 |
+| `no-future-schedule` | 调度本身算不出未来时间 | 配置无可算调度（前置校验已拦，理论到不了）；或假日 `drop` 把候选全作废且无下一个调度点（366 天全假日的极端） |
+
+**失败**：`400` / `401` / `403`。
 
 <Endpoint id="ep-tasks-sign-secrets" method="GET" path="/api/v1/tasks/:id/sign-secrets" name="读取签名密钥" />
 
