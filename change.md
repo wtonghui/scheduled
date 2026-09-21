@@ -1,6 +1,10 @@
 ### 通知能力
 
 - 邮件模板：emailSubjectTemplate / emailBodyTemplate / emailAttachmentUrlTemplate，支持 {path} 占位符从响应数据取值渲染
+- 失败专用模板：emailSubjectTemplateFailed / emailBodyTemplateFailed（null=回退成功模板）
+- 业务成败自动判定：HTTP 2xx 且包体含 `code` 时仅数字 200 算成功，其余失败（`msg` 作失败原因，不重试）；无 `code` 包体保持成功
+- 模板派生字段：statusText（成功/失败）、failureReason、previewTableHtml（前 20 行表格）、previewNote、fileSizeText、fileDesc，另有中文别名（任务名称/执行状态/失败原因/结果总数量/文件格式/预览行数/预览结果表格/文件说明/文件链接/站内链接/执行时间）
+- 默认邮件正文精简：仅 Run / Status / Task / Scheduled / Duration（去 Error 行与站内链接 footer）
 - succeeded_with_results：notifyOn 新增此值，有结果数据时才发通知
 - 中继回收：认领后 10 分钟未完成的 in_progress 邮件/webhook 自动回收重投
 
@@ -376,9 +380,9 @@
 | 属性 | 值 |
 |------|------|
 | 类型 | string[] |
-| 是否必传 | 是 |
-| 格式 | 合法 email 地址数组，至少 1 个 |
-| 默认值 | 无 |
+| 是否必传 | 否（缺席默认 `[]`） |
+| 格式 | 合法 email 地址数组，可空数组 |
+| 默认值 | `[]`（不要邮件通知） |
 
 **示例**：
 
@@ -386,7 +390,7 @@
 "recipients": ["ops@example.com", "dev@example.com"]
 ```
 
-**含义**：任务执行后通知的收件人邮箱列表。即使不配邮件模板，默认也有系统标题和正文。
+**含义**：任务执行后通知的收件人邮箱列表。即使不配邮件模板，默认也有系统标题和正文。为空（或不传）时不写邮件 outbox、不发邮件，webhook 按 `notifyOn` 照发；想完全静默就收件人留空且不配 `webhookUrl`。
 
 ### notifyOn — 通知触发状态
 
@@ -430,7 +434,7 @@
 
 **含义**：任务执行后在 notifyOn 门控下向此地址 POST webhook payload。webhook 带签名头（与 email 各自独立）。不配则不发 webhook。
 
-### 邮件模板参数（三个，均可选）
+### 邮件模板参数（五个，均可选）
 
 #### emailSubjectTemplate
 
@@ -450,6 +454,24 @@
 | 格式 | 最长 10,000 字符，支持 {path} 占位符 |
 | 默认值 | 无（用系统默认正文） |
 
+#### emailSubjectTemplateFailed — 失败专用标题
+
+| 属性 | 值 |
+|------|------|
+| 类型 | string（可选） |
+| 是否必传 | 否 |
+| 格式 | 最长 255 字符，支持 {path} 占位符 |
+| 默认值 | 无（回退成功标题模板） |
+
+#### emailBodyTemplateFailed — 失败专用正文
+
+| 属性 | 值 |
+|------|------|
+| 类型 | string（可选） |
+| 是否必传 | 否 |
+| 格式 | 最长 10,000 字符，支持 {path} 占位符 |
+| 默认值 | 无（回退成功正文模板） |
+
 #### emailAttachmentUrlTemplate
 
 | 属性 | 值 |
@@ -468,17 +490,23 @@
 | 值为 object | 替换为 JSON.stringify 结果 |
 | 没找到 | 保留原始 {xxx} 不变，并打 warn 日志 |
 
+**上下文来源**：内层 `data` 字段平铺 + 系统/派生字段：`statusText`（成功/失败）、`failureReason`（外层 `msg` 优先）、`previewTableHtml`（预览表格前 20 行 HTML）、`previewRowsMail`、`previewNote`、`fileSizeText`、`fileDesc`；中文别名：`任务名称`、`执行时间`、`执行状态`、`失败原因`、`结果总数量`、`文件格式`、`预览行数`、`预览结果表格`、`文件说明`、`文件链接`、`站内链接`。
+
+**业务成败自动判定**：HTTP 非 2xx 按原逻辑失败；HTTP 2xx 且包体含 `code` 时仅数字 `200` 算成功，其余全失败（`msg` 作失败原因，按永久错处理不重试）；包体无 `code` 则成功。无需任务配置。
+
 **示例**：
 
 ```json
 {
-  "emailSubjectTemplate": "任务 {taskName} 执行完成",
-  "emailBodyTemplate": "状态：{status}，耗时：{durationMs}ms",
-  "emailAttachmentUrlTemplate": "https://example.com/report/{data.reportId}.pdf"
+  "emailSubjectTemplate": "【SQL定时查询】{任务名称} · {执行状态}",
+  "emailBodyTemplate": "结果共{结果总数量}行 {预览结果表格} 下载：{文件链接}",
+  "emailSubjectTemplateFailed": "【SQL定时查询】{任务名称} · {执行状态}",
+  "emailBodyTemplateFailed": "失败原因：{失败原因} 查看：{站内链接}",
+  "emailAttachmentUrlTemplate": "{文件链接}"
 }
 ```
 
-**注意**：不支持条件/循环，要复杂逻辑走 webhook 自渲染。附件 URL 渲染后持久化到 EmailLog，中继投递时下载。
+**注意**：不支持条件/循环，要复杂逻辑走 webhook 自渲染。附件 URL 渲染后持久化到 EmailLog，中继投递时下载（≤2MB 内联附件，超限/失败自动降级只发链接）。默认邮件（无模板时）正文仅 Run / Status / Task / Scheduled / Duration。
 
 ---
 
@@ -641,7 +669,6 @@ X-Trigger-Type: 1
 | unknown IANA timezone | timezone 不是合法 IANA 时区名 |
 | run-once tasks take no end rules, startsAt or overlap policy | runAt 任务传了 endsAt/maxRuns/startsAt/overlapPolicy（节假日除外，可配） |
 | holidayPolicy requires skipHolidays=true | holidayPolicy 非 drop 但没开 skipHolidays |
-| at least one recipient | recipients 为空数组 |
 | invalid recipient email | recipients 中有非邮箱格式 |
 | payload.url must be a valid URL | payload.url 不是合法 URL |
 | payload.method must be a standard HTTP method | method 不是枚举值 |

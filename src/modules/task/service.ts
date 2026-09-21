@@ -52,6 +52,8 @@ type TaskRow = Prisma.TaskGetPayload<{
     webhookUrl: true;
     emailSubjectTemplate: true;
     emailBodyTemplate: true;
+    emailSubjectTemplateFailed: true;
+    emailBodyTemplateFailed: true;
     emailAttachmentUrlTemplate: true;
     enabled: true;
     disabledReason: true;
@@ -115,6 +117,10 @@ export interface TaskView {
   emailSubjectTemplate: string | null;
   /** 邮件正文模板（HTML，{xxx} 占位）；null=沿用默认 React Email 模板 */
   emailBodyTemplate: string | null;
+  /** 失败专用标题模板；null=回退成功模板 */
+  emailSubjectTemplateFailed: string | null;
+  /** 失败专用正文模板；null=回退成功模板 */
+  emailBodyTemplateFailed: string | null;
   /** 附件 URL 模板（{xxx} 占位）；null=无附件 */
   emailAttachmentUrlTemplate: string | null;
   systemUserId?: string | null;
@@ -441,6 +447,8 @@ function toView(row: TaskRow, upcoming: UpcomingInfo | null = null): TaskView {
     webhookUrl: row.webhookUrl,
     emailSubjectTemplate: row.emailSubjectTemplate,
     emailBodyTemplate: row.emailBodyTemplate,
+    emailSubjectTemplateFailed: row.emailSubjectTemplateFailed,
+    emailBodyTemplateFailed: row.emailBodyTemplateFailed,
     emailAttachmentUrlTemplate: row.emailAttachmentUrlTemplate,
     systemUserId: (row as any).systemUserId ?? null,
     nextRunAt: row.nextRunAt,
@@ -609,6 +617,8 @@ export async function create(
     webhookUrl: data.webhookUrl ?? null,
     emailSubjectTemplate: data.emailSubjectTemplate ?? null,
     emailBodyTemplate: data.emailBodyTemplate ?? null,
+    emailSubjectTemplateFailed: data.emailSubjectTemplateFailed ?? null,
+    emailBodyTemplateFailed: data.emailBodyTemplateFailed ?? null,
     emailAttachmentUrlTemplate: data.emailAttachmentUrlTemplate ?? null,
     ...(data.systemUserId ? { systemUserId: data.systemUserId } : {}),
     webhookSecret: data.webhookUrl ? new Uint8Array(encryptSecret(generateWebhookSecret())) : null,
@@ -876,6 +886,12 @@ export async function update(
       }),
       ...(data.emailBodyTemplate !== undefined && {
         emailBodyTemplate: data.emailBodyTemplate,
+      }),
+      ...(data.emailSubjectTemplateFailed !== undefined && {
+        emailSubjectTemplateFailed: data.emailSubjectTemplateFailed,
+      }),
+      ...(data.emailBodyTemplateFailed !== undefined && {
+        emailBodyTemplateFailed: data.emailBodyTemplateFailed,
       }),
       ...(data.emailAttachmentUrlTemplate !== undefined && {
         emailAttachmentUrlTemplate: data.emailAttachmentUrlTemplate,

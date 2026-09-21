@@ -121,6 +121,42 @@ describe("task service CRUD (integration)", () => {
     ).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
   });
 
+  it("recipients is optional: omitted → [], explicit [] ok, bad email → 400", async () => {
+    const noKey = await taskService.create(tenantA, ownerTokenA, {
+      name: "no-recipients-key",
+      cron: "*/5 * * * *",
+      taskType: "noop",
+      payload: {},
+    });
+    expect(noKey.recipients).toEqual([]);
+
+    const empty = await taskService.create(tenantA, ownerTokenA, {
+      name: "empty-recipients",
+      cron: "*/5 * * * *",
+      taskType: "noop",
+      payload: {},
+      recipients: [],
+    });
+    expect(empty.recipients).toEqual([]);
+
+    await expect(
+      taskService.create(tenantA, ownerTokenA, {
+        name: "bad-recipient",
+        cron: "*/5 * * * *",
+        taskType: "noop",
+        payload: {},
+        recipients: ["not-an-email"],
+      }),
+    ).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+
+    // 更新清空收件人同样放行
+    const cleared = await taskService.update(tenantA, taskId, {
+      recipients: [],
+      version: 3,
+    });
+    expect(cleared.recipients).toEqual([]);
+  });
+
   it("run-now creates a pending execution", async () => {
     const execution = await taskService.runTaskNow(tenantA, taskId);
     expect(execution.trigger).toBe("manual");

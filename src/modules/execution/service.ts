@@ -48,6 +48,10 @@ export interface RunTaskDefinition {
   emailSubjectTemplate?: string | null;
   /** 邮件正文模板（HTML）；null=默认 React Email */
   emailBodyTemplate?: string | null;
+  /** 失败专用标题模板；null=回退成功模板 */
+  emailSubjectTemplateFailed?: string | null;
+  /** 失败专用正文模板；null=回退成功模板 */
+  emailBodyTemplateFailed?: string | null;
   /** 附件 URL 模板；null=无附件 */
   emailAttachmentUrlTemplate?: string | null;
 }
@@ -99,6 +103,33 @@ async function createExecution(
   }
 }
 
+/**
+ * 业务成败判定（自动两段式，无需任务配置）：
+ * HTTP 非 2xx 由执行器按原逻辑判失败；HTTP 2xx 且包体含 `code` 时，
+ * 仅数字 200 算成功，其余（0、字符串 "200" 等）全算失败，`msg` 作失败原因。
+ * 包体无 `code`（如 {ok:true}、纯文本）→ 成功，老行为不变。
+ * 命中失败返回可展示的原因串，调用方按永久错（HttpError 422，不重试）处理。
+ */
+export function businessFailureMessage(executorResult: unknown): string | null {
+  // 执行器返回值形如 { status, redirects, attempt, data }，data 即包体
+  const body = (executorResult as { data?: unknown } | null | undefined)?.data;
+  if (body == null || typeof body !== "object" || Array.isArray(body)) {
+    return null;
+  }
+  const record = body as Record<string, unknown>;
+  if (!("code" in record)) {
+    return null;
+  }
+  if (record.code === 200) {
+    return null;
+  }
+  const msg = record.msg;
+  if (typeof msg === "string" && msg.trim()) {
+    return msg;
+  }
+  return `business code ${String(record.code)}`;
+}
+
 function serializeError(error: unknown): Prisma.InputJsonValue {
   const err = error as { message?: string; status?: number; code?: string } | null;
   return {
@@ -139,6 +170,8 @@ async function finalizeExecution(
     systemUserId: task.systemUserId ?? null,
     emailSubjectTemplate: task.emailSubjectTemplate ?? null,
     emailBodyTemplate: task.emailBodyTemplate ?? null,
+    emailSubjectTemplateFailed: task.emailSubjectTemplateFailed ?? null,
+    emailBodyTemplateFailed: task.emailBodyTemplateFailed ?? null,
     emailAttachmentUrlTemplate: task.emailAttachmentUrlTemplate ?? null,
   };
   const summary: RunSummary = {
@@ -260,6 +293,15 @@ export async function runTaskWithScheduledAt(
         task.timeoutMs,
         opts.externalSignal,
       );
+      // 包体业务失败 → 按永久错处理（422 不重试，直接 failed + 失败通知；
+      // message 即上游 msg 原文，进 errorMessage 做失败原因展示）
+      const businessFailure = businessFailureMessage(execResult?.result);
+      if (businessFailure) {
+        // 结果挂在 error 上带进 catch：失败邮件仍需内层 data（站内链接/执行时间）
+        const err = new HttpError(422, businessFailure);
+        (err as { executorResult?: unknown }).executorResult = execResult?.result;
+        throw err;
+      }
       taskAttemptsTotal.inc({ status: "succeeded" });
       taskRunsTotal.inc({ status: "succeeded" });
       await finalizeExecution(
@@ -307,6 +349,7 @@ export async function runTaskWithScheduledAt(
           task,
           scheduledAt,
           (error as Error).message,
+          (error as { executorResult?: unknown }).executorResult,
         );
         logger.warn(
           { task_id: task.id, attempt, err: (error as Error).message },

@@ -156,6 +156,8 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `webhookUrl` | string \| null | 终态 Webhook 回调地址 |
 | `emailSubjectTemplate` | string \| null | 邮件标题模板（`{placeholder}` 渲染） |
 | `emailBodyTemplate` | string \| null | 邮件正文模板 |
+| `emailSubjectTemplateFailed` | string \| null | 失败专用标题模板；null=回退成功模板 |
+| `emailBodyTemplateFailed` | string \| null | 失败专用正文模板；null=回退成功模板 |
 | `emailAttachmentUrlTemplate` | string \| null | 附件 URL 模板 |
 | `nextRunAt` | string \| null | 下次触发时间（存储值；详情页“下次运行”优先展示下面的服务端测算） |
 | `upcoming` | object \| null | 服务端测算的下一次运行（含节假日/起止/配额；仅详情/创建/更新返回，列表为 null）：`scheduledAt`（string\|null）、`holidayAdjusted`（boolean）、`stoppedReason`（`endsAt`/`maxRuns`/`no-future-schedule`\|null） |
@@ -173,6 +175,7 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `params` | object | URL query 键值，执行时并入 url |
 | `headers` | object | 请求头（键 → 字符串值） |
 | `body` | string \| null | 原始请求体字符串（非 JSON 对象） |
+| 成败判定 | — | 自动两段式，无需配置：HTTP 非 2xx 按原逻辑失败；2xx 且包体含 `code` 时仅数字 `200` 算成功，其余全失败（`msg` 作失败原因，不重试）；包体无 `code` 则成功 |
 
 ### Execution 对象
 
@@ -403,12 +406,14 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `enabled` | boolean | 否 | 默认 `true` |
 | `maxAttempts` | int | 否 | 重试上限 1–10，默认 `3` |
 | `timeoutMs` | int | 否 | 单次超时 1000–3_600_000ms，默认 `30000` |
-| `recipients` | string[] | 是 | 终态邮件收件人，≥1 个合法邮箱 |
+| `recipients` | string[] | 否 | 终态邮件收件人；缺席/空数组=不发邮件（webhook 照发），默认 `[]` |
 | `notifyOn` | string[] | 否 | 默认 `["succeeded","failed"]` |
 | `webhookUrl` | string | 否 | 终态回调地址 |
 | `systemUserId` | string | 否 | 系统内用户标识（≤191 字符）；也可通过请求头 `X-System-User-Id` 传入 |
 | `emailSubjectTemplate` | string | 否 | 邮件标题模板（≤255），`{path}` 从响应数据取值渲染 |
 | `emailBodyTemplate` | string | 否 | 邮件正文模板（≤10000），同上 |
+| `emailSubjectTemplateFailed` | string | 否 | 失败专用标题模板（≤255）；null=回退成功模板 |
+| `emailBodyTemplateFailed` | string | 否 | 失败专用正文模板（≤10000）；null=回退成功模板 |
 | `emailAttachmentUrlTemplate` | string | 否 | 附件 URL 模板（≤512），渲染后持久化 |
 
 <Note>
@@ -875,6 +880,10 @@ function verify(body: string, header: string | undefined): boolean {
 ### 7.2 邮件通知
 
 配置 `recipients` + `notifyOn` 后终态自动发邮件；投递记录查 `GET /api/v1/email-log`（可按 `runId` / `status` 过滤）。
+
+模板上下文＝内层 `data` 字段平铺＋系统/派生字段：`statusText`（成功/失败）、`failureReason`（外层 `msg` 优先）、`previewTableHtml`（预览表格前 20 行 HTML）、`previewRowsMail`、`previewNote`、`fileSizeText`、`fileDesc`，另有中文别名（`任务名称`、`执行时间`、`执行状态`、`失败原因`、`结果总数量`、`文件格式`、`预览行数`、`预览结果表格`、`文件说明`、`文件链接`、`站内链接`）。缺值替换为空串，未知占位保留原文并打 warn 日志。
+
+失败优先用 `emailSubjectTemplateFailed` / `emailBodyTemplateFailed`（null=回退成功模板）。成败自动判定：HTTP 非 2xx 按原逻辑失败；2xx 且包体含 `code` 时仅数字 `200` 算成功，其余全失败（`msg` 作失败原因，不重试）；包体无 `code` 则成功。无模板时的默认正文仅 Run / Status / Task / Scheduled / Duration。
 
 <h2 id="envelope">8 · 响应格式与错误码</h2>
 

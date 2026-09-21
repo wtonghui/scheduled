@@ -29,6 +29,10 @@ export interface NotifyContext {
   emailSubjectTemplate?: string | null;
   /** 邮件正文模板（HTML）；null=默认 React Email */
   emailBodyTemplate?: string | null;
+  /** 失败专用标题模板；null=回退成功模板 */
+  emailSubjectTemplateFailed?: string | null;
+  /** 失败专用正文模板；null=回退成功模板 */
+  emailBodyTemplateFailed?: string | null;
   /** 附件 URL 模板；null=无附件 */
   emailAttachmentUrlTemplate?: string | null;
 }
@@ -84,19 +88,184 @@ export function shouldNotifyForStatus(
   return notifyOn.includes("succeeded_with_results") && hasNotificationResults(result);
 }
 
+/** 邮件预览表格最多展示行数（完整结果走文件下载与站内查看）。 */
+export const MAIL_PREVIEW_MAX_ROWS = 20;
+
+/** HTML 转义（预览表格单元格用，防上游数据里的标签被执行）。 */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** 字节数 → 人类可读（1887436 → 1.80 MB），解析失败回空串。 */
+function formatFileSize(value: unknown): string {
+  const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
+  if (typeof n !== "number" || !Number.isFinite(n) || n < 0) {
+    return "";
+  }
+  if (n < 1024) {
+    return `${n} B`;
+  }
+  const units = ["KB", "MB", "GB"];
+  let v = n / 1024;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u += 1;
+  }
+  return `${v.toFixed(2)} ${units[u]}`;
+}
+
+/**
+ * JSON 字符串/数组二选一解析：
+ * 上游 previewFileds/previewContent 是二次序列化的 JSON 字符串，
+ * 兼容直接传数组的情况；解析失败返回 null（调用方降级）。
+ */
+function parseJsonArray(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * 预览表格渲染：字段名做表头，前 N 行做表体，全程转义。
+ * 任一步解析失败返回 null（调用方保留占位符原文 + warn，不炸邮件）。
+ */
+function buildPreviewTableHtml(
+  fieldsValue: unknown,
+  contentValue: unknown,
+  maxRows: number,
+): string | null {
+  const fields = parseJsonArray(fieldsValue);
+  const rows = parseJsonArray(contentValue);
+  if (!fields || !rows) {
+    return null;
+  }
+  const head = fields
+    .map((f) => `<th>${escapeHtml(String(f))}</th>`)
+    .join("");
+  const body = rows
+    .slice(0, maxRows)
+    .map((row) => {
+      const cells = fields
+        .map((f) => {
+          const v =
+            row && typeof row === "object"
+              ? (row as Record<string, unknown>)[String(f)]
+              : null;
+          return `<td>${escapeHtml(v == null ? "" : String(v))}</td>`;
+        })
+        .join("");
+      return `<tr>${cells}</tr>`;
+    })
+    .join("");
+  return `<table border="1" cellpadding="4" cellspacing="0"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
 /**
  * 从执行器返回值中提取模板上下文。
  * HTTP 执行器返回 { status, redirects, attempt, data }，其中 data 是响应体 {code, msg, data}。
- * 直接用响应体里内层 data 对象的字段做上下文（{rowCount}、{fileUrl}）：
- * 有内层 data 且为对象 → 用它（原对象引用，不拷贝不合并）；
- * 否则 → 空上下文（占位符保留原文 + warn）。
+ * 上下文 = 内层 data 字段平铺（{rowCount}、{fileUrl}，老模板不受影响）
+ * + 系统/派生字段（{statusText}、{failureReason}、{previewTableHtml}、{fileDesc}…）
+ * + 中文别名（{任务名称}、{执行状态}、{失败原因}…）。
+ * 失败路径执行器结果缺席时，用 summary.taskName/errorMessage 兜底，保证失败模板永远有字。
  */
 function buildTemplateContext(summary: RunSummary): Record<string, unknown> {
-  const inner = (summary.result as { data?: { data?: unknown } } | null | undefined)?.data?.data;
-  if (inner && typeof inner === "object" && !Array.isArray(inner)) {
-    return inner as Record<string, unknown>;
-  }
-  return {};
+  const envelope = (summary.result as { data?: unknown } | null | undefined)?.data;
+  const inner =
+    envelope && typeof envelope === "object" && !Array.isArray(envelope)
+      ? (envelope as Record<string, unknown>).data
+      : undefined;
+  const data: Record<string, unknown> =
+    inner && typeof inner === "object" && !Array.isArray(inner)
+      ? { ...(inner as Record<string, unknown>) }
+      : {};
+  const ok = summary.status === "succeeded";
+  const statusText = ok ? "成功" : "失败";
+
+  // 失败原因：外层 msg 优先（业务失败），其次内层 failureReason，最后执行错误
+  const envelopeMsg =
+    envelope && typeof envelope === "object" && !Array.isArray(envelope)
+      ? (envelope as Record<string, unknown>).msg
+      : undefined;
+  const failureReason =
+    (!ok && typeof envelopeMsg === "string" && envelopeMsg.trim()
+      ? envelopeMsg
+      : null) ??
+    (typeof data.failureReason === "string" && data.failureReason.trim()
+      ? data.failureReason
+      : null) ??
+    summary.errorMessage ??
+    "";
+
+  // 预览表格：上游双 JSON 字符串在 worker 侧拼成 HTML，只取前 N 行
+  const previewTableHtml = buildPreviewTableHtml(
+    data.previewFileds ?? data.previewFields,
+    data.previewContent,
+    MAIL_PREVIEW_MAX_ROWS,
+  );
+  const previewTotal =
+    typeof data.previewRowCount === "number" ? data.previewRowCount : null;
+  const previewRowsMail =
+    previewTotal != null ? Math.min(previewTotal, MAIL_PREVIEW_MAX_ROWS) : null;
+  const rowTotal = typeof data.rowCount === "number" ? data.rowCount : null;
+  const previewNote =
+    rowTotal != null && previewTotal != null && previewRowsMail != null
+      ? `预览共 ${previewTotal} 行，结果共 ${rowTotal} 行，本邮件展示前 ${previewRowsMail} 行，完整结果请下载文件或前往站内查看`
+      : null;
+
+  // 文件说明：文件名 + 人类可读大小 + 格式，缺啥略啥
+  const fileSizeText = formatFileSize(data.fileSize);
+  const fileDescParts = [
+    typeof data.fileName === "string" && data.fileName ? data.fileName : null,
+    typeof data.fileType === "string" && data.fileType ? data.fileType : null,
+    fileSizeText || null,
+  ].filter((p): p is string => p != null);
+  const fileDesc = fileDescParts.length > 0 ? fileDescParts.join(" / ") : null;
+
+  const taskName =
+    typeof data.taskName === "string" && data.taskName ? data.taskName : summary.taskName;
+
+  return {
+    ...data,
+    taskName,
+    statusText,
+    executionAt: data.executionAt ?? null,
+    failureReason,
+    rowCount: data.rowCount ?? null,
+    fileType: data.fileType ?? null,
+    fileUrl: data.fileUrl ?? null,
+    viewUrl: data.viewUrl ?? null,
+    previewTableHtml,
+    previewRowsMail,
+    previewNote,
+    fileSizeText: fileSizeText || null,
+    fileDesc,
+    // 中文别名（信纸用中文占位同样可替换）
+    任务名称: taskName,
+    执行状态: statusText,
+    执行时间: data.executionAt ?? null,
+    失败原因: failureReason,
+    结果总数量: data.rowCount ?? null,
+    文件格式: data.fileType ?? null,
+    预览行数: previewRowsMail,
+    预览结果表格: previewTableHtml,
+    文件说明: fileDesc,
+    文件链接: data.fileUrl ?? null,
+    站内链接: data.viewUrl ?? null,
+  };
 }
 
 /** 简易 HTML → 纯文本：剥标签、压缩空白。给纯文本邮件客户端兜底用。 */
@@ -131,22 +300,28 @@ export async function renderTaskEmail(
   templates?: {
     subject?: string | null;
     body?: string | null;
+    /** 失败专用标题；null=回退 subject */
+    subjectFailed?: string | null;
+    /** 失败专用正文；null=回退 body */
+    bodyFailed?: string | null;
     attachmentUrl?: string | null;
   },
 ): Promise<RenderedEmail> {
   const ctx = buildTemplateContext(summary);
   const logTag = { taskId: summary.taskId, runId: summary.executionId };
+  const failed = summary.status !== "succeeded";
 
-  // 标题：有模板用模板，无模板用默认
-  const subject = templates?.subject
-    ? renderTemplate(templates.subject, ctx, logTag)
+  // 标题/正文：失败优先用失败专用模板（null=回退成功模板，无模板用默认）
+  const subjectTemplate = failed ? (templates?.subjectFailed ?? templates?.subject) : templates?.subject;
+  const subject = subjectTemplate
+    ? renderTemplate(subjectTemplate, ctx, logTag)
     : emailSubject(summary.taskName, summary.status);
 
-  // 正文：有模板用模板（HTML），无模板用默认 React Email
+  const bodyTemplate = failed ? (templates?.bodyFailed ?? templates?.body) : templates?.body;
   let html: string;
   let text: string;
-  if (templates?.body) {
-    html = renderTemplate(templates.body, ctx, logTag);
+  if (bodyTemplate) {
+    html = renderTemplate(bodyTemplate, ctx, logTag);
     text = stripHtml(html);
   } else {
     const props = {
@@ -205,6 +380,8 @@ export async function prepareNotificationOutbox(
       const { html, text, subject, attachmentUrl } = await renderTaskEmail(summary, {
         subject: ctx.emailSubjectTemplate,
         body: ctx.emailBodyTemplate,
+        subjectFailed: ctx.emailSubjectTemplateFailed,
+        bodyFailed: ctx.emailBodyTemplateFailed,
         attachmentUrl: ctx.emailAttachmentUrlTemplate,
       });
       out.email = {
@@ -372,6 +549,8 @@ export async function healMissingOutbox(limit = HEAL_BATCH): Promise<number> {
         systemUserId: true,
         emailSubjectTemplate: true,
         emailBodyTemplate: true,
+        emailSubjectTemplateFailed: true,
+        emailBodyTemplateFailed: true,
         emailAttachmentUrlTemplate: true,
       },
     });
@@ -413,6 +592,8 @@ export async function healMissingOutbox(limit = HEAL_BATCH): Promise<number> {
       systemUserId: task.systemUserId,
       emailSubjectTemplate: task.emailSubjectTemplate,
       emailBodyTemplate: task.emailBodyTemplate,
+      emailSubjectTemplateFailed: task.emailSubjectTemplateFailed,
+      emailBodyTemplateFailed: task.emailBodyTemplateFailed,
       emailAttachmentUrlTemplate: task.emailAttachmentUrlTemplate,
     };
     const summary: RunSummary = {

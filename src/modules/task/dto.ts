@@ -168,11 +168,14 @@ export const CreateTaskSchema = z
     timeoutMs: z.number().int().min(1000).max(3_600_000).default(30_000),
     recipients: z
       .array(z.string().email("invalid recipient email"))
-      .min(1, "at least one recipient"),
+      // 选填：缺席/空数组=不要邮件通知（webhook 照发）；每项仍须合法邮箱
+      .default([]),
     notifyOn: z.array(NotifyOnSchema).default(["succeeded", "failed"]),
     webhookUrl: z.string().url().optional(),
     emailSubjectTemplate: z.string().trim().max(255).optional(),
     emailBodyTemplate: z.string().trim().max(10_000).optional(),
+    emailSubjectTemplateFailed: z.string().trim().max(255).optional(),
+    emailBodyTemplateFailed: z.string().trim().max(10_000).optional(),
     emailAttachmentUrlTemplate: z.string().trim().max(512).optional(),
     systemUserId: z.string().trim().max(191).optional(),
   })
@@ -224,11 +227,13 @@ export const UpdateTaskSchema = z
     enabled: z.boolean().optional(),
     maxAttempts: z.number().int().min(1).max(10).optional(),
     timeoutMs: z.number().int().min(1000).max(3_600_000).optional(),
-    recipients: z.array(z.string().email("invalid recipient email")).min(1).optional(),
+    recipients: z.array(z.string().email("invalid recipient email")).optional(),
     notifyOn: z.array(NotifyOnSchema).optional(),
     webhookUrl: z.string().url().nullable().optional(),
     emailSubjectTemplate: z.string().trim().max(255).nullable().optional(),
     emailBodyTemplate: z.string().trim().max(10_000).nullable().optional(),
+    emailSubjectTemplateFailed: z.string().trim().max(255).nullable().optional(),
+    emailBodyTemplateFailed: z.string().trim().max(10_000).nullable().optional(),
     emailAttachmentUrlTemplate: z.string().trim().max(512).nullable().optional(),
     systemUserId: z.string().trim().max(191).nullable().optional(),
     /**

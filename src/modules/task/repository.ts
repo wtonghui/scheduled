@@ -30,6 +30,8 @@ const TASK_SELECT = {
   webhookUrl: true,
   emailSubjectTemplate: true,
   emailBodyTemplate: true,
+  emailSubjectTemplateFailed: true,
+  emailBodyTemplateFailed: true,
   emailAttachmentUrlTemplate: true,
   enabled: true,
   disabledReason: true,

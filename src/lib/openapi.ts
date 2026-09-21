@@ -75,7 +75,7 @@ registry.registerPath({
         "application/json": {
           schema: {
             type: "object",
-            required: ["name", "recipients"],
+            required: ["name"],
             properties: {
               name: ST,
               cron: { ...ST, example: "*/5 * * * *" },

@@ -33,6 +33,8 @@ interface TaskDetail {
   holidayPolicy: string;
   emailSubjectTemplate: string | null;
   emailBodyTemplate: string | null;
+  emailSubjectTemplateFailed: string | null;
+  emailBodyTemplateFailed: string | null;
   emailAttachmentUrlTemplate: string | null;
   taskType: "http" | "noop";
   payload: Record<string, unknown>;
@@ -128,6 +130,8 @@ export default function EditTaskPage() {
       ...(values.holidayPolicy ? { holidayPolicy: values.holidayPolicy } : {}),
       emailSubjectTemplate: values.emailSubjectTemplate ?? null,
       emailBodyTemplate: values.emailBodyTemplate ?? null,
+      emailSubjectTemplateFailed: values.emailSubjectTemplateFailed ?? null,
+      emailBodyTemplateFailed: values.emailBodyTemplateFailed ?? null,
       emailAttachmentUrlTemplate: values.emailAttachmentUrlTemplate ?? null,
       taskType: values.taskType,
       payload:
@@ -198,6 +202,8 @@ export default function EditTaskPage() {
           holidayPolicy: task.holidayPolicy,
           emailSubjectTemplate: task.emailSubjectTemplate,
           emailBodyTemplate: task.emailBodyTemplate,
+          emailSubjectTemplateFailed: task.emailSubjectTemplateFailed,
+          emailBodyTemplateFailed: task.emailBodyTemplateFailed,
           emailAttachmentUrlTemplate: task.emailAttachmentUrlTemplate,
           payload: task.payload,
           recipients: task.recipients,

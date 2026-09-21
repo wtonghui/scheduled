@@ -57,6 +57,8 @@ interface DueRow {
   webhookSecret: Uint8Array | string | null;
   emailSubjectTemplate: string | null;
   emailBodyTemplate: string | null;
+  emailSubjectTemplateFailed: string | null;
+  emailBodyTemplateFailed: string | null;
   emailAttachmentUrlTemplate: string | null;
   execSignSecret: Uint8Array | string | null;
   systemUserId: string | null;
@@ -100,6 +102,8 @@ function toTaskDefinition(row: DueRow): RunTaskDefinition {
     webhookSecret: toBytes(row.webhookSecret),
     emailSubjectTemplate: row.emailSubjectTemplate,
     emailBodyTemplate: row.emailBodyTemplate,
+    emailSubjectTemplateFailed: row.emailSubjectTemplateFailed,
+    emailBodyTemplateFailed: row.emailBodyTemplateFailed,
     emailAttachmentUrlTemplate: row.emailAttachmentUrlTemplate,
     execSignSecret: toBytes(row.execSignSecret),
     systemUserId: row.systemUserId ?? null,
@@ -118,6 +122,8 @@ const TASK_COLUMNS = Prisma.sql`
   webhook_url AS webhookUrl, webhook_secret AS webhookSecret,
   email_subject_template AS emailSubjectTemplate,
   email_body_template AS emailBodyTemplate,
+  email_subject_template_failed AS emailSubjectTemplateFailed,
+  email_body_template_failed AS emailBodyTemplateFailed,
   email_attachment_url_template AS emailAttachmentUrlTemplate,
   exec_sign_secret AS execSignSecret, system_user_id AS systemUserId
 `;

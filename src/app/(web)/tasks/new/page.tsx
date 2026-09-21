@@ -49,6 +49,12 @@ export default function NewTaskPage() {
         : {}),
       ...(values.emailSubjectTemplate ? { emailSubjectTemplate: values.emailSubjectTemplate } : {}),
       ...(values.emailBodyTemplate ? { emailBodyTemplate: values.emailBodyTemplate } : {}),
+      ...(values.emailSubjectTemplateFailed
+        ? { emailSubjectTemplateFailed: values.emailSubjectTemplateFailed }
+        : {}),
+      ...(values.emailBodyTemplateFailed
+        ? { emailBodyTemplateFailed: values.emailBodyTemplateFailed }
+        : {}),
       ...(values.emailAttachmentUrlTemplate
         ? { emailAttachmentUrlTemplate: values.emailAttachmentUrlTemplate }
         : {}),

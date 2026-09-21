@@ -3,7 +3,6 @@ import {
   Container,
   Head,
   Heading,
-  Hr,
   Html,
   Preview,
   Section,
@@ -26,8 +25,8 @@ export interface TaskCompleteEmailProps {
 }
 
 export function TaskCompleteEmail(props: TaskCompleteEmailProps) {
-  const { taskName, status, taskId, runId, scheduledAt, durationMs, errorMessage, appBaseUrl } =
-    props;
+  // 默认正文只留运行五项；errorMessage/appBaseUrl 保留在接口上（调用方不动），正文不再渲染
+  const { taskName, status, taskId, runId, scheduledAt, durationMs } = props;
   const ok = status === "succeeded";
   const icon = ok ? "✅" : "❌";
 
@@ -67,19 +66,7 @@ export function TaskCompleteEmail(props: TaskCompleteEmailProps) {
                 <strong>Duration</strong>: {durationMs}ms
               </Text>
             )}
-            {errorMessage && (
-              <Text style={{ color: "#b42318" }}>
-                <strong>Error</strong>: {errorMessage}
-              </Text>
-            )}
           </Section>
-          <Hr />
-          <Text style={{ fontSize: 12, color: "#666" }}>
-            <a target="_blank" href={`${appBaseUrl}/tasks/${taskId}`} rel="noreferrer">
-              查看详情
-            </a>{" "}
-            · Scheduled Task Manager
-          </Text>
         </Container>
       </Body>
     </Html>

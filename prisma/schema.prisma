@@ -85,6 +85,8 @@ model Task {
   emailSubjectTemplate    String?         @map("email_subject_template") @db.VarChar(255)
   emailBodyTemplate       String?         @map("email_body_template") @db.Text
   emailAttachmentUrlTemplate String?      @map("email_attachment_url_template") @db.VarChar(512)
+  emailSubjectTemplateFailed String?      @map("email_subject_template_failed") @db.VarChar(255) // 失败专用标题；null=回退成功模板
+  emailBodyTemplateFailed String?         @map("email_body_template_failed") @db.Text // 失败专用正文；null=回退成功模板
   nextRunAt               DateTime?       @map("next_run_at") @db.DateTime(6)
   claimedBy               String?         @map("claimed_by") @db.VarChar(64)
   claimedUntil            DateTime?       @map("claimed_until") @db.DateTime(6)

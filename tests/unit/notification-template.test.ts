@@ -74,6 +74,103 @@ describe("renderTaskEmail with user templates (flattened data context)", () => {
     );
   });
 
+  it("renders SQL preview table (first 20 rows), status and Chinese aliases", async () => {
+    const rows = Array.from({ length: 30 }, (_, i) => ({ id: i + 1, name: `n${i + 1}` }));
+    const out = await renderTaskEmail(
+      {
+        ...summary,
+        taskName: "任务名",
+        result: {
+          status: 200,
+          redirects: 0,
+          attempt: 1,
+          data: {
+            code: 200,
+            msg: "成功",
+            data: {
+              taskName: "任务名",
+              executionAt: "2026-09-18 11:11:00",
+              rowCount: 1286,
+              fileUrl: "https://minio.example.com/scheduled-task/xxx/result.xlsx",
+              fileSize: 1887436,
+              fileType: "xlsx",
+              fileName: "文件名",
+              previewRowCount: 500,
+              previewFileds: JSON.stringify(["id", "name"]),
+              previewContent: JSON.stringify(rows),
+              viewUrl: "http://www.xxx.com/yyy/zzz",
+            },
+          },
+        },
+      },
+      {
+        subject: "【SQL定时查询】{任务名称} · {执行状态}",
+        body: "任务名称：{任务名称} 执行时间：{执行时间} 总数：{结果总数量} 行 格式：{文件格式} 预览：{预览行数} {预览结果表格} 说明：{文件说明} 下载：{文件链接} 查看：{站内链接}",
+        attachmentUrl: "{文件链接}",
+      },
+    );
+    expect(out.subject).toBe("【SQL定时查询】任务名 · 成功");
+    expect(out.html).toContain("任务名称：任务名");
+    expect(out.html).toContain("总数：1286 行");
+    expect(out.html).toContain("<table");
+    // 只取前 20 行：第 20 行在，第 21 行不在
+    expect(out.html).toContain("<td>20</td>");
+    expect(out.html).not.toContain("<td>21</td>");
+    expect(out.html).toContain("1.80 MB");
+    expect(out.html).toContain("http://www.xxx.com/yyy/zzz");
+  });
+
+  it("resolves failure reason from outer msg when result is absent", async () => {
+    const out = await renderTaskEmail(
+      {
+        ...summary,
+        status: "failed" as const,
+        errorMessage: "SQL 执行超时",
+        result: undefined,
+      },
+      {
+        subject: "【SQL定时查询】{任务名称} · {执行状态}",
+        body: "任务名称：{任务名称} 失败原因：{失败原因} 查看：{站内链接}",
+      },
+    );
+    expect(out.subject).toBe("【SQL定时查询】每日对账 · 失败");
+    expect(out.html).toContain("失败原因：SQL 执行超时");
+  });
+
+  it("picks failed templates on failure and falls back when absent", async () => {
+    const failed = {
+      ...summary,
+      status: "failed" as const,
+      errorMessage: "SQL 执行超时",
+      result: {
+        status: 200,
+        redirects: 0,
+        attempt: 1,
+        data: {
+          code: 0,
+          msg: "SQL 执行超时",
+          data: { taskName: "任务名", executionAt: "2026-09-18 11:11:00" },
+        },
+      },
+    };
+    const out = await renderTaskEmail(failed, {
+      subject: "成功标题",
+      body: "成功正文",
+      subjectFailed: "【SQL定时查询】{任务名称} · {执行状态}",
+      bodyFailed: "失败原因：{失败原因}",
+    });
+    expect(out.subject).toBe("【SQL定时查询】任务名 · 失败");
+    expect(out.html).toContain("失败原因：SQL 执行超时");
+
+    // 失败专用缺席 → 回退成功模板
+    const fallback = await renderTaskEmail(failed, {
+      subject: "标题 {执行状态}",
+      body: "正文 {执行状态}",
+    });
+    expect(fallback.subject).toBe("标题 失败");
+    expect(fallback.html).toContain("正文 失败");
+  });
+
   it("does not duplicate the link when the body already contains the url", async () => {
     const out = await renderTaskEmail(summary, {
       subject: "任务完成 — {rowCount} 行",

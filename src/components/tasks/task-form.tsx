@@ -42,6 +42,8 @@ export interface TaskInitial {
   holidayPolicy: string;
   emailSubjectTemplate: string | null;
   emailBodyTemplate: string | null;
+  emailSubjectTemplateFailed: string | null;
+  emailBodyTemplateFailed: string | null;
   emailAttachmentUrlTemplate: string | null;
   payload: Record<string, unknown>;
   recipients: string[];
@@ -77,6 +79,10 @@ export interface TaskFormValues {
   emailSubjectTemplate?: string;
   /** 邮件正文模板（HTML）；空=默认 React Email 模板 */
   emailBodyTemplate?: string;
+  /** 失败专用标题模板；空=回退成功模板 */
+  emailSubjectTemplateFailed?: string;
+  /** 失败专用正文模板；空=回退成功模板 */
+  emailBodyTemplateFailed?: string;
   /** 附件 URL 模板（{xxx} 占位）；空=无附件 */
   emailAttachmentUrlTemplate?: string;
   taskType: "http" | "noop";
@@ -199,6 +205,12 @@ export default function TaskForm({
     initial?.emailSubjectTemplate ?? "",
   );
   const [emailBodyTemplate, setEmailBodyTemplate] = useState(initial?.emailBodyTemplate ?? "");
+  const [emailSubjectTemplateFailed, setEmailSubjectTemplateFailed] = useState(
+    initial?.emailSubjectTemplateFailed ?? "",
+  );
+  const [emailBodyTemplateFailed, setEmailBodyTemplateFailed] = useState(
+    initial?.emailBodyTemplateFailed ?? "",
+  );
   const [emailAttachmentUrlTemplate, setEmailAttachmentUrlTemplate] = useState(
     initial?.emailAttachmentUrlTemplate ?? "",
   );
@@ -408,6 +420,8 @@ export default function TaskForm({
       holidayPolicy: !skipHolidays ? undefined : holidayPolicy,
       emailSubjectTemplate: emailSubjectTemplate.trim() || undefined,
       emailBodyTemplate: emailBodyTemplate.trim() || undefined,
+      emailSubjectTemplateFailed: emailSubjectTemplateFailed.trim() || undefined,
+      emailBodyTemplateFailed: emailBodyTemplateFailed.trim() || undefined,
       emailAttachmentUrlTemplate: emailAttachmentUrlTemplate.trim() || undefined,
       taskType: form.taskType,
       url: form.url,
@@ -759,7 +773,7 @@ export default function TaskForm({
               id="task-email-subject"
               value={emailSubjectTemplate}
               onChange={(e) => setEmailSubjectTemplate(e.target.value)}
-              placeholder="如：任务完成 — {rowCount} 行"
+              placeholder="如：【SQL定时查询】{任务名称} · {执行状态}"
               className="mt-1.5 font-mono text-xs"
             />
           </div>
@@ -771,7 +785,31 @@ export default function TaskForm({
               id="task-email-body"
               value={emailBodyTemplate}
               onChange={(e) => setEmailBodyTemplate(e.target.value)}
-              placeholder={'如：共 {rowCount} 行<br><a href="{fileUrl}">下载文件</a>'}
+              placeholder={'如：任务名称：{任务名称} 执行时间：{执行时间} 结果总数量：{结果总数量}行 文件格式：{文件格式} {预览结果表格} {文件说明} 下载链接：{文件链接} 点击查看本次执行详情：{站内链接}'}
+              className="mt-1.5 font-mono text-xs"
+            />
+          </div>
+          <div className="col-span-2 mt-4">
+            <Label htmlFor="task-email-subject-failed">
+              失败专用标题模板（可空=回退成功标题。用 {"{字段名}"} 从响应 data 取值）
+            </Label>
+            <Input
+              id="task-email-subject-failed"
+              value={emailSubjectTemplateFailed}
+              onChange={(e) => setEmailSubjectTemplateFailed(e.target.value)}
+              placeholder="如：【SQL定时查询】{任务名称} · {执行状态}"
+              className="mt-1.5 font-mono text-xs"
+            />
+          </div>
+          <div className="col-span-2 mt-4">
+            <Label htmlFor="task-email-body-failed">
+              失败专用正文模板（可空=回退成功正文。HTML，用 {"{字段名}"} 取值）
+            </Label>
+            <Textarea
+              id="task-email-body-failed"
+              value={emailBodyTemplateFailed}
+              onChange={(e) => setEmailBodyTemplateFailed(e.target.value)}
+              placeholder={'如：任务名称：{任务名称} 执行时间：{执行时间} 失败原因：{失败原因} 点击查看本次执行详情：{站内链接}'}
               className="mt-1.5 font-mono text-xs"
             />
           </div>
@@ -802,7 +840,7 @@ export default function TaskForm({
           </div>
           <div className="col-span-2 mt-4">
             <Label htmlFor="task-recipients">
-              收件人（逗号分隔邮箱） <span className="text-bad">*</span>
+              收件人（逗号分隔邮箱，可空；为空则不发邮件）
             </Label>
             <Input
               id="task-recipients"
