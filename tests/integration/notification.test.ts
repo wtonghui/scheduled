@@ -1,6 +1,6 @@
 import http from "node:http";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { decryptSecret } from "../../src/lib/crypto";
+import { config } from "../../src/lib/config";
 import { prisma } from "../../src/lib/db";
 import { registerDefaultExecutors } from "../../src/modules/execution/register";
 import { runTaskWithScheduledAt } from "../../src/modules/execution/service";
@@ -17,7 +17,7 @@ import { cleanupTenant, createTestTask, createTestTenant, createTestToken } from
 
 let server: http.Server;
 let baseUrl: string;
-let webhookHits: Array<{ body: string; signature: string | undefined }> = [];
+let webhookHits: Array<{ body: string; signature: string | undefined; executionId: string | undefined }> = [];
 let failFirst = false;
 
 function startServer(): Promise<string> {
@@ -35,6 +35,7 @@ function startServer(): Promise<string> {
           webhookHits.push({
             body,
             signature: req.headers["x-scheduled-signature"] as string | undefined,
+            executionId: req.headers["x-execution-id"] as string | undefined,
           });
           res.writeHead(200);
           res.end("ok");
@@ -106,7 +107,7 @@ describe("notification outbox + relays", () => {
     await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())));
   });
 
-  it("success run → exactly one email + one webhook, HMAC verifies, relay idempotent", async () => {
+  it("success run → exactly one email + one webhook, fixed-secret HMAC verifies, relay idempotent", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0);
     const task = await taskService.create(tenantId, ownerTokenId, {
       name: "notify-ok",
@@ -140,13 +141,24 @@ describe("notification outbox + relays", () => {
     expect(hook?.status).toBe("sent");
     expect(hook?.responseCode).toBe(200);
 
-    const secret = def.webhookSecret ? decryptSecret(new Uint8Array(def.webhookSecret)) : "";
+    // Webhook V3：固定密钥签名 + X-Execution-Id 两头
+    const secret = config.TASK_CALLBACK_SIGN_SECRET as string;
+    expect(secret).toBeTruthy();
     expect(webhookHits).toHaveLength(1);
     const verdict = verifyWebhook(webhookHits[0]!.body, webhookHits[0]!.signature, secret);
     expect(verdict.valid).toBe(true);
-    const payload = JSON.parse(webhookHits[0]!.body) as { status: string; runId: string };
+    expect(webhookHits[0]!.executionId).toBe(outcome.executionId);
+    const payload = JSON.parse(webhookHits[0]!.body) as {
+      status: string;
+      runId: string;
+      nextRunAt: string | null;
+      disabledReason: string | null;
+    };
     expect(payload.status).toBe("succeeded");
     expect(payload.runId).toBe(outcome.executionId);
+    // 重复任务：下次触发非空（北京时间 ISO），未停用原因 null
+    expect(typeof payload.nextRunAt).toBe("string");
+    expect(payload.disabledReason).toBeNull();
 
     // 幂等：再次跑中继 → 0 新投递
     expect(await runEmailRelayOnce(20)).toBe(0);
@@ -154,7 +166,7 @@ describe("notification outbox + relays", () => {
     expect(webhookHits).toHaveLength(1);
   });
 
-  it("notifyOn=[failed] → 成功运行零通知；失败运行邮件+webhook 均入 outbox", async () => {
+  it("notifyOn=[failed] → 成功运行仅webhook（邮件被门控）；失败运行邮件+webhook 均入 outbox", async () => {
     const task = await taskService.create(tenantId, ownerTokenId, {
       name: "notify-gated",
       cron: "*/5 * * * *",
@@ -167,11 +179,11 @@ describe("notification outbox + relays", () => {
 
     const def = await loadTaskDef(task.id);
 
-    // 成功：notifyOn 只订阅 failed → 邮件与 webhook 都不应产生
+    // 成功：notifyOn 只订阅 failed → 邮件不应产生；webhook 只看 url 照发（V3 解耦）
     const okRun = await runTaskWithScheduledAt(def, new Date(), "scheduled");
     expect(okRun.status).toBe("succeeded");
     expect(await prisma.emailLog.count({ where: { runId: okRun.executionId } })).toBe(0);
-    expect(await prisma.webhookDelivery.count({ where: { runId: okRun.executionId } })).toBe(0);
+    expect(await prisma.webhookDelivery.count({ where: { runId: okRun.executionId } })).toBe(1);
 
     // 失败（404 永久错误，单次即终态）：两类通知都应产生
     const failingDef = { ...def, payload: { ...def.payload, url: `${baseUrl}/missing` } };
@@ -273,7 +285,7 @@ describe("notification outbox + relays", () => {
       where: { runId: outcome.executionId },
     });
     expect(hook?.status).toBe("sent");
-    expect(hook?.webhookSecret).toBeTruthy(); // 密钥快照持久化
+    expect(hook?.webhookSecret).toBeNull(); // V3：固定密钥签名，不再做 per-task 密钥快照
 
     // 任务删除（含历史执行）也应可成功
     await taskService.remove(tenantId, task.id);
@@ -330,11 +342,14 @@ describe("notification outbox + relays", () => {
     const def = await loadTaskDef(created.id);
     const outcome = await runTaskWithScheduledAt(def, new Date(), "scheduled");
     expect(outcome.status).toBe("succeeded");
-    // noop 结果 {kind} 无 data → 邮件 webhook 都不入 outbox
+    // noop 结果 {kind} 无 data → 邮件不入 outbox；webhook 只看 url 照发（V3 解耦）
     expect(await prisma.emailLog.findMany({ where: { taskId: created.id } })).toHaveLength(0);
+    const hooks = await prisma.webhookDelivery.findMany({ where: { runId: outcome.executionId } });
+    expect(hooks).toHaveLength(1);
+    await runWebhookRelayOnce(20);
     expect(
-      await prisma.webhookDelivery.findMany({ where: { runId: outcome.executionId } }),
-    ).toHaveLength(0);
+      (await prisma.webhookDelivery.findUnique({ where: { id: hooks[0]!.id } }))?.status,
+    ).toBe("sent");
   });
 
   it("stale in_progress relay rows are reclaimed and delivered", async () => {

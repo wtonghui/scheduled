@@ -21,6 +21,10 @@ export interface NotifyContext {
   recipients: string[];
   notifyOn: string[];
   webhookUrl: string | null;
+  /** 下次触发快照（终态写入前任务行的值；null=无后续运行） */
+  nextRunAt?: Date | null;
+  /** 停用原因快照（未停用=null） */
+  disabledReason?: string | null;
   /** AES 加密后的 HMAC 密钥快照（中继解密后验签；任务被删仍可投递）。 */
   webhookSecretBytes: Uint8Array | null;
   /** 系统内用户标识（外部接入系统具体用户），用于通知归属追溯。 */
@@ -171,7 +175,7 @@ function buildPreviewTableHtml(
       return `<tr>${cells}</tr>`;
     })
     .join("");
-  return `<table border="1" cellpadding="4" cellspacing="0"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  return `<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:14px;"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 
 /**
@@ -288,6 +292,50 @@ function escapeHtmlAttr(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
+/** 正则特殊字符转义（linkify 按原文匹配 URL 用）。 */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const LINK_BUTTON_STYLE =
+  "display:inline-block;background-color:#2563eb;color:#ffffff;" +
+  "text-decoration:none;padding:8px 20px;border-radius:6px;font-size:14px;";
+
+/**
+ * 裸 URL 链接化：把正文里以纯文本出现的 URL 换成按钮（已在 href="..." 或 <a>…</a> 内的跳过，
+ * 用户手写的链接不动）。label 为按钮文案，URL 只进 href（转义后），正文更干净。
+ */
+function linkifyPlainUrl(html: string, url: string, label: string): string {
+  const anchor = `<a href="${escapeHtmlAttr(url)}" style="${LINK_BUTTON_STYLE}">${label}</a>`;
+  const pattern = new RegExp(escapeRegExp(url), "g");
+  return html.replace(pattern, (match, offset: number, full: string) => {
+    const before = full.slice(0, offset as number);
+    // 前面有未闭合的 <a → 已在链接标签头或链接文本区，跳过
+    if (before.lastIndexOf("<a") > before.lastIndexOf("</a>")) {
+      return match;
+    }
+    return anchor;
+  });
+}
+
+/**
+ * 自定义模板后处理（只进 HTML 版，纯文本版保留裸 URL 与原始换行）：
+ * 1. `{文件链接}` → 「下载附件」按钮；`{站内链接}` → 「查看详情」按钮；
+ * 2. 模板里的换行保留为 `<br>`（HTML 邮件原本会吞掉换行，导致多字段挤成一段）。
+ */
+function beautifyCustomEmailHtml(html: string, ctx: Record<string, unknown>): string {
+  let out = html.replace(/\r\n/g, "\n");
+  const fileUrl = typeof ctx.fileUrl === "string" ? ctx.fileUrl : "";
+  const viewUrl = typeof ctx.viewUrl === "string" ? ctx.viewUrl : "";
+  if (fileUrl) {
+    out = linkifyPlainUrl(out, fileUrl, "下载附件");
+  }
+  if (viewUrl && viewUrl !== fileUrl) {
+    out = linkifyPlainUrl(out, viewUrl, "查看详情");
+  }
+  return out.replace(/\n/g, "<br>");
+}
+
 export interface RenderedEmail {
   html: string;
   text: string;
@@ -322,7 +370,8 @@ export async function renderTaskEmail(
   let text: string;
   if (bodyTemplate) {
     html = renderTemplate(bodyTemplate, ctx, logTag);
-    text = stripHtml(html);
+    text = stripHtml(html); // 纯文本版：原始换行 + 裸 URL，信息完整可拷贝
+    html = beautifyCustomEmailHtml(html, ctx);
   } else {
     const props = {
       taskName: summary.taskName,
@@ -344,11 +393,15 @@ export async function renderTaskEmail(
     ? renderTemplate(templates.attachmentUrl, ctx, logTag)
     : null;
 
-  // 有附件且正文没带 URL 时追一段下载链接：网关吞附件后用户仍有入口；
-  // 模板自带链接的不重复。默认模板（无 attachmentUrl）不受影响。
+  // 有附件且正文没带 URL 时追一个按钮式下载块：网关吞附件后用户仍有入口；
+  // 全内联样式（邮件客户端兼容），模板自带链接的不重复。默认模板（无 attachmentUrl）不受影响。
   if (attachmentUrl && !html.includes(attachmentUrl)) {
-    html += `<p>附件下载：<a href="${escapeHtmlAttr(attachmentUrl)}">下载附件</a></p>`;
-    text = `${text}\n附件下载：${attachmentUrl}`;
+    html +=
+      `<div style="margin:24px 0 8px;">附件下载：</div>` +
+      `<div style="margin:0 0 8px;"><a href="${escapeHtmlAttr(attachmentUrl)}" ` +
+      `style="display:inline-block;background-color:#2563eb;color:#ffffff;` +
+      `text-decoration:none;padding:10px 24px;border-radius:6px;font-size:14px;">下载附件</a></div>`;
+    text = `${text}\n\n附件下载：${attachmentUrl}`;
   }
 
   return { html, text, subject, attachmentUrl: attachmentUrl || null };
@@ -368,8 +421,8 @@ export async function prepareNotificationOutbox(
   const statusKey = summary.status === "succeeded" ? "succeeded" : "failed";
   const shouldEmail =
     ctx.recipients.length > 0 && shouldNotifyForStatus(ctx.notifyOn, statusKey, summary.result);
-  const shouldWebhook =
-    !!ctx.webhookUrl && shouldNotifyForStatus(ctx.notifyOn, statusKey, summary.result);
+  // Webhook V3：只看 webhookUrl 有无（有即终态必发），与邮件/notifyOn 解耦
+  const shouldWebhook = !!ctx.webhookUrl?.trim();
   if (!shouldEmail && !shouldWebhook) {
     return null;
   }
@@ -418,6 +471,8 @@ export async function prepareNotificationOutbox(
         startedAt: summary.startedAt ? toBeijingIso(summary.startedAt) : null,
         finishedAt: summary.finishedAt ? toBeijingIso(summary.finishedAt) : null,
         durationMs: summary.durationMs,
+        nextRunAt: ctx.nextRunAt ? toBeijingIso(ctx.nextRunAt) : null,
+        disabledReason: ctx.disabledReason ?? null,
         ...(summary.errorMessage ? { error: { message: summary.errorMessage } } : {}),
       }) as Prisma.InputJsonValue,
     };
@@ -546,6 +601,8 @@ export async function healMissingOutbox(limit = HEAL_BATCH): Promise<number> {
         notifyOn: true,
         webhookUrl: true,
         webhookSecret: true,
+        nextRunAt: true,
+        disabledReason: true,
         systemUserId: true,
         emailSubjectTemplate: true,
         emailBodyTemplate: true,
@@ -558,14 +615,12 @@ export async function healMissingOutbox(limit = HEAL_BATCH): Promise<number> {
       continue;
     }
     const notifyOn = (task.notifyOn as string[]) ?? [];
+    const recipients = (task.recipients as string[]) ?? [];
+    // Webhook V3：自愈同样只看 webhookUrl；邮件仍走 notifyOn（含 succeeded_with_results 跳过逻辑见下）
+    const needWebhook = !!task.webhookUrl?.trim();
     const plainOk =
       run.status === "succeeded" ? notifyOn.includes("succeeded") : notifyOn.includes("failed");
-    if (!plainOk) {
-      continue;
-    }
-    const recipients = (task.recipients as string[]) ?? [];
-    const needEmail = recipients.length > 0;
-    const needWebhook = !!task.webhookUrl;
+    const needEmail = recipients.length > 0 && plainOk;
     if (!needEmail && !needWebhook) {
       continue;
     }
@@ -588,6 +643,8 @@ export async function healMissingOutbox(limit = HEAL_BATCH): Promise<number> {
       recipients,
       notifyOn,
       webhookUrl: task.webhookUrl,
+      nextRunAt: task.nextRunAt ?? null,
+      disabledReason: task.disabledReason ?? null,
       webhookSecretBytes: task.webhookSecret ? new Uint8Array(task.webhookSecret) : null,
       systemUserId: task.systemUserId,
       emailSubjectTemplate: task.emailSubjectTemplate,

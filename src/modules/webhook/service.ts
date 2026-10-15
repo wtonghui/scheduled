@@ -13,6 +13,10 @@ export interface RunResultPayload {
   startedAt: string | null;
   finishedAt: string | null;
   durationMs: number | null;
+  /** 下次触发（北京时间 ISO；null=无后续运行，如一次性跑完或已停用） */
+  nextRunAt: string | null;
+  /** 停用原因（未停用=null）：manual / run_once_done / ends_at / max_runs / no_future_schedule / unknown */
+  disabledReason: string | null;
   error?: unknown;
   result?: unknown;
 }
@@ -27,6 +31,8 @@ export function buildWebhookPayload(input: RunResultPayload): Prisma.InputJsonVa
     startedAt: input.startedAt,
     finishedAt: input.finishedAt,
     durationMs: input.durationMs,
+    nextRunAt: input.nextRunAt,
+    disabledReason: input.disabledReason,
     ...(input.error !== undefined ? { error: input.error } : {}),
     ...(input.result !== undefined ? { result: input.result } : {}),
   } as Prisma.InputJsonValue;

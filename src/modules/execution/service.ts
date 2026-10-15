@@ -186,6 +186,13 @@ async function finalizeExecution(
     errorMessage: errorMessage ?? null,
     result: executorResult,
   };
+  // 终态快照：领取时 next_run_at 已推进、停用原因已写入，读行即得下次触发与停用状态；
+  // 读失败降级 null（只影响 webhook payload 两字段，绝不阻塞终态落库）
+  const taskState = await prisma.task
+    .findUnique({ where: { id: task.id }, select: { nextRunAt: true, disabledReason: true } })
+    .catch(() => null);
+  notifyCtx.nextRunAt = taskState?.nextRunAt ?? null;
+  notifyCtx.disabledReason = taskState?.disabledReason ?? null;
   // 事务外预渲染：CPU 活不持 DB 锁；模板坏了只记日志不阻塞终态
   let prepared = null;
   try {

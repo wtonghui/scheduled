@@ -1,4 +1,3 @@
-import { decryptSecret } from "../src/lib/crypto";
 import { config } from "../src/lib/config";
 import { prisma } from "../src/lib/db";
 import { HttpError, TimeoutError } from "../src/lib/errors";
@@ -6,13 +5,14 @@ import { logger } from "../src/lib/logger";
 import { classifyError, jitteredDelayMs } from "../src/lib/retry";
 import { webhookSentTotal, webhookFailedTotal, webhookBreakersOpen } from "../src/lib/metrics";
 import { MAX_REDIRECTS, checkUrlForSsrf } from "../src/lib/ssrf";
-import { signWebhook } from "../src/modules/webhook/signature";
+import { buildTaskSignature } from "../src/modules/webhook/signature";
 import { createPool } from "../src/lib/concurrency";
 import { perTenantShare, pickStart, rotatedOrder } from "../src/lib/fairness";
 
 /**
  * Webhook 中继（FR-016 / contracts 投递契约）：
- * 轮询 webhook_delivery(pending) → POST payload + `X-Scheduled-Signature: t/v1`。
+ * 轮询 webhook_delivery(pending) → POST payload + 固定密钥两头
+ * (`X-Scheduled-Signature: t/v1` + `X-Execution-Id`；无密钥即裸发，与 http 执行器一致）。
  * 2xx sent；429/5xx/超时重试；4xx 永久 failed；耗尽 dead。run_id 唯一幂等。
  * 认领后崩溃遗留的 in_progress（updatedAt 超过阈值）会被回收重投，避免静默丢失。
  */
@@ -130,7 +130,11 @@ function throwSsrfError(prefix: string, reason: string): never {
  * fetch 默认跟随重定向会绕过初始 SSRF 校验，此处与 http 执行器同策略。
  * 超时（DOM AbortError）统一转自定义 TimeoutError，保证 classifyError 判可重试。
  */
-async function postWebhook(url: string, body: string, signature: string): Promise<Response> {
+async function postWebhook(
+  url: string,
+  body: string,
+  extraHeaders: Record<string, string>,
+): Promise<Response> {
   let current = url;
   for (let hop = 0; ; hop += 1) {
     let res: Response;
@@ -139,7 +143,7 @@ async function postWebhook(url: string, body: string, signature: string): Promis
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-scheduled-signature": signature,
+          ...extraHeaders,
         },
         body,
         redirect: "manual",
@@ -307,12 +311,20 @@ export async function runWebhookRelayOnce(limit = config.RELAY_BATCH_SIZE): Prom
         throwSsrfError("webhook url blocked", ssrf.reason);
       }
 
-      // 复用签名前的原始 body，确保 HMAC 覆盖投递字节
+      // 复用签名前的原始 body，确保 HMAC 覆盖投递字节。
+      // Webhook V3：固定密钥（TASK_CALLBACK_SIGN_SECRET）签名，只发两头；
+      // 无密钥即裸发（与 http 执行器一致，X-Execution-Id 也不附带）。
       const body = typeof row.payload === "string" ? row.payload : JSON.stringify(row.payload);
-      const secret = row.webhookSecret ? decryptSecret(new Uint8Array(row.webhookSecret)) : "";
-      const signature = signWebhook(body, secret);
+      const signSecret = config.TASK_CALLBACK_SIGN_SECRET;
+      const extraHeaders: Record<string, string> = {};
+      let signature: string | null = null;
+      if (signSecret) {
+        signature = buildTaskSignature(signSecret, Math.floor(Date.now() / 1000), body);
+        extraHeaders["x-scheduled-signature"] = signature;
+        extraHeaders["x-execution-id"] = row.runId;
+      }
 
-      const res = await postWebhook(row.webhookUrl, body, signature);
+      const res = await postWebhook(row.webhookUrl, body, extraHeaders);
 
       if (res.status >= 200 && res.status < 300) {
         await prisma.webhookDelivery.update({

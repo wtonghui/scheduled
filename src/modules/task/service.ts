@@ -566,6 +566,13 @@ export async function create(
       throw new AppError(400, "VALIDATION", `url blocked by SSRF policy: ${ssrf.reason}`);
     }
   }
+  // Webhook V3：webhookUrl 与 payload.url 同规则做 SSRF 校验
+  if (data.webhookUrl) {
+    const hookCheck = await checkUrlForSsrf(data.webhookUrl);
+    if (!hookCheck.ok) {
+      throw new AppError(400, "VALIDATION", `webhookUrl blocked by SSRF policy: ${hookCheck.reason}`);
+    }
+  }
 
   const { publicPayload, secretBytes } = splitPayload(data.taskType, httpPayload);
   const timezone = data.timezone ?? DEFAULT_TIMEZONE;
@@ -621,7 +628,8 @@ export async function create(
     emailBodyTemplateFailed: data.emailBodyTemplateFailed ?? null,
     emailAttachmentUrlTemplate: data.emailAttachmentUrlTemplate ?? null,
     ...(data.systemUserId ? { systemUserId: data.systemUserId } : {}),
-    webhookSecret: data.webhookUrl ? new Uint8Array(encryptSecret(generateWebhookSecret())) : null,
+    // Webhook V3：固定密钥签名，不再按任务生成 webhookSecret（列保留置 NULL 兼容）
+    webhookSecret: null,
     // 任务执行请求签名密钥：每个 http 任务自动生成（加密存）；取值恒走 env（对方单密钥验签），
     // Phase 2 对方按任务验签后启用本列
     execSignSecret:
@@ -689,6 +697,14 @@ export async function update(
     secretsUpdate = split.secretBytes;
   }
 
+  // Webhook V3：webhookUrl 与 payload.url 同规则做 SSRF 校验
+  if (data.webhookUrl) {
+    const hookCheck = await checkUrlForSsrf(data.webhookUrl);
+    if (!hookCheck.ok) {
+      throw new AppError(400, "VALIDATION", `webhookUrl blocked by SSRF policy: ${hookCheck.reason}`);
+    }
+  }
+
   // 重算 next_run_at（生效调度 = 传入覆盖既有；传入新调度会清掉其它调度字段，保持三选一）
   let nextRunAt: Date | null | undefined;
   const scheduleTouched = "cron" in data || "scheduleIntervalSeconds" in data || "runAt" in data;
@@ -729,12 +745,13 @@ export async function update(
         "timezone is only meaningful with cron or runAt (fixed intervals carry no wall-clock)",
       );
     }
-    // 结束规则/重叠策略/开始时刻/节假日仅重复调度可配；单独出现时按既有调度校验（一次任务 → 400）
+    // 结束规则/重叠策略/开始时刻/节假日仅重复调度可配；单独出现时按既有调度校验（一次任务 → 400）。
+    // 空值（null）视为未传：全量序列化客户端会顺手带 null 字段，不应触发 400。
     const endRuleTouched =
-      "endsAt" in data ||
-      "maxRuns" in data ||
+      (data.endsAt !== undefined && data.endsAt !== null) ||
+      (data.maxRuns !== undefined && data.maxRuns !== null) ||
       "overlapPolicy" in data ||
-      "startsAt" in data ||
+      (data.startsAt !== undefined && data.startsAt !== null) ||
       "skipHolidays" in data ||
       "holidayPolicy" in data;
     if (endRuleTouched && effKind === "runAt") {
@@ -792,22 +809,50 @@ export async function update(
       disabledBy: opts.actorTokenId ?? null,
     };
   } else if (data.enabled === true && existing.enabled === false) {
-    // 重启用：按既有调度（含一次性时刻与时区）重算；已过的一次性时刻由 worker 到期即领
-    const reSchedule = {
-      cron: (existing.cron ?? undefined) as string | undefined,
-      scheduleIntervalSeconds: (existing.scheduleIntervalSeconds ?? undefined) as
-        | number
-        | undefined,
-    };
-    const reFirst = existing.runAt
-      ? existing.runAt
-      : resolveFirstRun(reSchedule, existing.startsAt, existing.timezone, new Date());
-    nextRunAt = await applyHolidayPolicy(reFirst, {
-      skipHolidays: existing.skipHolidays,
-      holidayPolicy: existing.holidayPolicy,
-      timezone: existing.timezone,
-      schedule: reSchedule,
-    });
+    // 重启用：同包带了新调度时复用上面已按生效值算出的 nextRunAt，
+    // 否则按生效调度（含一次性时刻与时区，同包覆盖优先）重算；
+    // 已过的一次性时刻由 worker 到期即领。
+    // 注意：直接用既有值重算会覆盖同包新 runAt，导致 nextRunAt=旧时刻、
+    // worker 秒级误跑旧时刻后重新自动停用（disabledAt 看似“没清空”）。
+    if (nextRunAt === undefined) {
+      const effCron = data.cron !== undefined ? data.cron : existing.cron;
+      const effInterval =
+        data.scheduleIntervalSeconds !== undefined
+          ? data.scheduleIntervalSeconds
+          : existing.scheduleIntervalSeconds;
+      const effRunAt =
+        data.runAt !== undefined ? (data.runAt ? new Date(data.runAt) : null) : existing.runAt;
+      const effTimezone =
+        data.timezone !== undefined ? (data.timezone ?? DEFAULT_TIMEZONE) : existing.timezone;
+      const effStartsAt =
+        data.startsAt !== undefined
+          ? data.startsAt
+            ? new Date(data.startsAt)
+            : null
+          : existing.startsAt;
+      const effSkipHolidays =
+        data.skipHolidays !== undefined ? data.skipHolidays : existing.skipHolidays;
+      const effPolicy =
+        data.holidayPolicy !== undefined ? data.holidayPolicy : existing.holidayPolicy;
+      const reSchedule = {
+        cron: (effCron ?? undefined) as string | undefined,
+        scheduleIntervalSeconds: (effInterval ?? undefined) as number | undefined,
+      };
+      const reFirst = effRunAt
+        ? effRunAt
+        : resolveFirstRun(reSchedule, effStartsAt, effTimezone, new Date());
+      nextRunAt = await applyHolidayPolicy(reFirst, {
+        skipHolidays: effSkipHolidays,
+        holidayPolicy: effPolicy,
+        timezone: effTimezone,
+        schedule: reSchedule,
+      });
+      if (!nextRunAt && !effRunAt) {
+        // 重复调度算不出下次（cron 年份过期等）：拒绝启用僵尸任务。
+        // runAt 单次除外——已过时刻按既有语义由 worker 到期即领。
+        throw new AppError(400, "VALIDATION", "schedule yields no future run");
+      }
+    }
     // 重启用 fail-fast：有问题的复活直接 400，不进“启用又立刻死”循环。
     // 判的是生效后值（重置/同包新规则都已折入），与创建校验同口径。
     if (effectiveMaxRuns != null && effectiveConsumed >= effectiveMaxRuns) {
@@ -820,12 +865,11 @@ export async function update(
     if (effectiveEndsAt && nextRunAt && effectiveEndsAt.getTime() <= nextRunAt.getTime()) {
       throw new AppError(400, "VALIDATION", "endsAt is before the first scheduled run");
     }
-    if (!nextRunAt && !existing.runAt) {
-      // 重复调度算不出下次（cron 年份过期等）：拒绝启用僵尸任务。
-      // runAt 单次除外——已过时刻按既有语义由 worker 到期即领。
-      throw new AppError(400, "VALIDATION", "schedule yields no future run");
-    }
     // 重启用清空停用原因三字段
+    stopFields = { disabledReason: null, disabledAt: null, disabledBy: null };
+  } else if (data.enabled === true) {
+    // 已启用任务显式传 enabled:true：调度变更由上面的 policyTouched 分支处理，
+    // 这里只保证不残留停用戳（顺手修复历史脏数据）。
     stopFields = { disabledReason: null, disabledAt: null, disabledBy: null };
   }
 
@@ -875,11 +919,10 @@ export async function update(
         recipients: data.recipients as Prisma.InputJsonValue,
       }),
       ...(data.notifyOn !== undefined && { notifyOn: data.notifyOn as Prisma.InputJsonValue }),
+      // Webhook V3：固定密钥签名，更新 url 时同步清掉历史 per-task 密钥快照列
       ...(data.webhookUrl !== undefined && {
         webhookUrl: data.webhookUrl,
-        webhookSecret: data.webhookUrl
-          ? new Uint8Array(encryptSecret(generateWebhookSecret()))
-          : null,
+        webhookSecret: null,
       }),
       ...(data.emailSubjectTemplate !== undefined && {
         emailSubjectTemplate: data.emailSubjectTemplate,
@@ -999,7 +1042,8 @@ export async function getSignSecrets(
   logger.info({ task_id: id }, "sign secrets viewed");
   return {
     taskId: row.id,
-    webhookSecret: row.webhookSecret ? decryptSecret(new Uint8Array(row.webhookSecret)) : null,
+    // Webhook V3：固定密钥签名，per-task webhookSecret 已退场，恒返回 null
+    webhookSecret: null,
     execSignSecret: row.execSignSecret ? decryptSecret(new Uint8Array(row.execSignSecret)) : null,
   };
 }
@@ -1017,19 +1061,16 @@ export async function rotateSignSecret(
   if (!existing) {
     throw new AppError(404, "NOT_FOUND", "task not found");
   }
-  if (key === "webhookSecret" && !existing.webhookUrl) {
-    throw new AppError(400, "VALIDATION", "no webhook configured, nothing to rotate");
+  // Webhook V3：per-task webhookSecret 已退场（固定密钥签名），直接拒绝轮换
+  if (key === "webhookSecret") {
+    throw new AppError(400, "VALIDATION", "webhookSecret retired, webhook uses fixed signing secret");
   }
   if (key === "execSignSecret" && existing.taskType !== "http") {
     throw new AppError(400, "VALIDATION", "only http tasks carry an exec sign secret");
   }
   const secret = generateWebhookSecret();
   const encrypted = new Uint8Array(encryptSecret(secret));
-  if (key === "webhookSecret") {
-    await prisma.task.updateMany({ where: { id, tenantId }, data: { webhookSecret: encrypted } });
-  } else {
-    await prisma.task.updateMany({ where: { id, tenantId }, data: { execSignSecret: encrypted } });
-  }
+  await prisma.task.updateMany({ where: { id, tenantId }, data: { execSignSecret: encrypted } });
   logger.warn({ task_id: id, key }, "sign secret rotated");
   return { taskId: id, key, secret };
 }

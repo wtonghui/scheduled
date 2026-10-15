@@ -7,14 +7,19 @@
 - 默认邮件正文精简：仅 Run / Status / Task / Scheduled / Duration（去 Error 行与站内链接 footer）
 - succeeded_with_results：notifyOn 新增此值，有结果数据时才发通知
 - 中继回收：认领后 10 分钟未完成的 in_progress 邮件/webhook 自动回收重投
+- webhook 判定解耦（V3）：只看有没有配 `webhookUrl`，有即每个终态必发，不再受 `notifyOn` / `recipients` 约束（后两者只控制邮件）；自愈补插同口径
+- webhook 固定密钥签名（V3）：终态回调改用服务端 `TASK_CALLBACK_SIGN_SECRET` 签名，只发两头 `X-Scheduled-Signature` + `X-Execution-Id`（不要 `X-Trigger-Type`）；未配密钥即裸发（与任务执行请求一致）；per-task `webhookSecret` 已退场（不再生成/轮换，读恒 null）
+- webhookUrl 入参与 `payload.url` 同规则做 SSRF 校验（创建/修改时拦，投递前与重定向逐跳复查保留）
+- webhook payload 新增 `nextRunAt`（下次触发，北京时间 ISO；无后续运行为 null）与 `disabledReason`（停用原因，未停用为 null），终态写入前按任务行快照取值
+- 自定义邮件正文自动美化：模板换行保留为换行，纯文本形态的 `{文件链接}` / `{站内链接}` 分别渲染成「下载附件」「查看详情」蓝色按钮（手写链接不动；纯文本版保留裸链接）；默认模板加成功/失败状态徽标与行间距
 
 ### 安全与对接
 
 - 回调签名（对接 sqleditor）：HTTP 执行请求在配置 TASK_CALLBACK_SIGN_SECRET 后自动附带三个签名头：
-  - X-Scheduled-Signature：t=<unix时间戳>,v1=<hmac-sha256(t.<rawBody>,secret)>，与 webhook 出站签名同构
+  - X-Scheduled-Signature：t=<unix时间戳>,v1=<hmac-sha256(t.<rawBody>,secret)>，终态 webhook 复用同一固定密钥（只发前两头）
   - X-Execution-Id：本次执行的 runId（execution.id），供对方幂等对账
-  - X-Trigger-Type：触发类型，1=定时调度 / 2=手动触发 / 3=失败后重试
-  密钥优先级：env 共享密钥 > 任务级 execSignSecret > 不签名
+  - X-Trigger-Type：触发类型，1=定时调度 / 2=手动触发 / 3=失败后重试（仅任务执行请求带，终态 webhook 不带）
+  密钥优先级：env 共享密钥 > 任务级 execSignSecret > 不签名（终态 webhook 只认 env 固定密钥，无则裸发）
 
 ## 时间格式做了什么
 

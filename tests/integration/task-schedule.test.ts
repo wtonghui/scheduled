@@ -138,6 +138,56 @@ describe("task schedule extensions (integration)", () => {
     expect(updated.scheduleIntervalSeconds).toBeNull();
   });
 
+  it("update run-once task with explicit null end rules → passes (null treated as absent)", async () => {
+    const created = await taskService.create(tenantId, ownerTokenId, {
+      name: "once-nulls",
+      runAt: new Date(Date.now() + 3_600_000).toISOString(),
+      taskType: "noop",
+      payload: {},
+      recipients: ["ops@example.com"],
+    });
+    const runAt = new Date(Date.now() + 7_200_000).toISOString();
+    const updated = await taskService.update(tenantId, created.id, {
+      runAt,
+      endsAt: null,
+      maxRuns: null,
+      startsAt: null,
+      version: created.version,
+    });
+    expect(updated.runAt?.toISOString()).toBe(new Date(runAt).toISOString());
+    expect(updated.nextRunAt?.toISOString()).toBe(new Date(runAt).toISOString());
+  });
+
+  it("update run-once task with real end-rule values → still 400", async () => {
+    const created = await taskService.create(tenantId, ownerTokenId, {
+      name: "once-real-rules",
+      runAt: new Date(Date.now() + 3_600_000).toISOString(),
+      taskType: "noop",
+      payload: {},
+      recipients: ["ops@example.com"],
+    });
+    await expect(
+      taskService.update(tenantId, created.id, {
+        runAt: new Date(Date.now() + 7_200_000).toISOString(),
+        maxRuns: 3,
+        version: created.version,
+      }),
+    // 真值（maxRuns: 3）在 DTO 层先被拦（message 为 invalid task input），照样 400
+    ).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+    // 显式非空值走 service 层排斥校验（DTO 的 !! 放行 false，service 按 key 存在性拦）
+    await expect(
+      taskService.update(tenantId, created.id, {
+        runAt: new Date(Date.now() + 7_200_000).toISOString(),
+        skipHolidays: false,
+        version: created.version,
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      status: 400,
+      message: "run-once tasks take no end rules, startsAt, holiday rules or overlap policy",
+    });
+  });
+
   it("update timezone on interval task → 400", async () => {
     const created = await taskService.create(tenantId, ownerTokenId, {
       name: "interval-task",
@@ -557,7 +607,7 @@ describe("sign secret exchange (integration)", () => {
     await cleanupTenant(otherTenantId);
   });
 
-  it("reads both secrets for http task with webhookUrl", async () => {
+  it("reads secrets for http task with webhookUrl (webhookSecret retired → null)", async () => {
     const created = await taskService.create(tenantId, ownerTokenId, {
       name: "sign-read",
       cron: "* * * * *",
@@ -568,13 +618,13 @@ describe("sign secret exchange (integration)", () => {
     });
     const secrets = await taskService.getSignSecrets(tenantId, created.id);
     expect(secrets.taskId).toBe(created.id);
-    expect(secrets.webhookSecret).toMatch(/^[0-9a-f]{64}$/);
+    // Webhook V3：固定密钥签名，per-task webhookSecret 恒为 null
+    expect(secrets.webhookSecret).toBeNull();
     expect(secrets.execSignSecret).toMatch(/^[0-9a-f]{64}$/);
     // 与库里密文解密一致
     const row = await prisma.task.findUnique({ where: { id: created.id } });
-    const dbWebhook = row?.webhookSecret ? decryptSecret(new Uint8Array(row.webhookSecret)) : null;
+    expect(row?.webhookSecret).toBeNull();
     const dbExec = row?.execSignSecret ? decryptSecret(new Uint8Array(row.execSignSecret)) : null;
-    expect(dbWebhook).toBe(secrets.webhookSecret);
     expect(dbExec).toBe(secrets.execSignSecret);
   });
 
@@ -599,7 +649,7 @@ describe("sign secret exchange (integration)", () => {
     });
   });
 
-  it("rotates webhookSecret; new enqueues use new, old snapshot untouched", async () => {
+  it("rotates execSignSecret; webhookSecret rotation retired → 400", async () => {
     const created = await taskService.create(tenantId, ownerTokenId, {
       name: "sign-rotate",
       cron: "* * * * *",
@@ -609,14 +659,18 @@ describe("sign secret exchange (integration)", () => {
       webhookUrl: "https://example.com/webhook",
     });
     const before = await taskService.getSignSecrets(tenantId, created.id);
-    const rotated = await taskService.rotateSignSecret(tenantId, created.id, "webhookSecret");
-    expect(rotated.key).toBe("webhookSecret");
+    // Webhook V3：webhookSecret 轮换已退场
+    await expect(
+      taskService.rotateSignSecret(tenantId, created.id, "webhookSecret"),
+    ).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+    const rotated = await taskService.rotateSignSecret(tenantId, created.id, "execSignSecret");
+    expect(rotated.key).toBe("execSignSecret");
     expect(rotated.secret).toMatch(/^[0-9a-f]{64}$/);
-    expect(rotated.secret).not.toBe(before.webhookSecret);
+    expect(rotated.secret).not.toBe(before.execSignSecret);
     const after = await taskService.getSignSecrets(tenantId, created.id);
-    expect(after.webhookSecret).toBe(rotated.secret);
-    // exec 密钥不受影响
-    expect(after.execSignSecret).toBe(before.execSignSecret);
+    expect(after.execSignSecret).toBe(rotated.secret);
+    // webhook 密钥恒为 null，不受影响
+    expect(after.webhookSecret).toBeNull();
   });
 
   it("rotate rejects meaningless targets → 400/404", async () => {

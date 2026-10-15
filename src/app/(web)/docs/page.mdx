@@ -152,8 +152,8 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `maxAttempts` | number | 同次调度内最多尝试次数（1–10） |
 | `timeoutMs` | number | 单次执行超时（毫秒） |
 | `recipients` | string[] | 终态邮件收件人 |
-| `notifyOn` | string[] | 触发通知的终态：`succeeded` / `failed` / `succeeded_with_results` |
-| `webhookUrl` | string \| null | 终态 Webhook 回调地址 |
+| `notifyOn` | string[] | 邮件通知开关（仅控制邮件）：`succeeded` / `failed` / `succeeded_with_results` |
+| `webhookUrl` | string \| null | 终态 Webhook 回调地址；有即每个终态必发（不受 `notifyOn` 约束），创建/修改时经 SSRF 校验（与 `payload.url` 同规则） |
 | `emailSubjectTemplate` | string \| null | 邮件标题模板（`{placeholder}` 渲染） |
 | `emailBodyTemplate` | string \| null | 邮件正文模板 |
 | `emailSubjectTemplateFailed` | string \| null | 失败专用标题模板；null=回退成功模板 |
@@ -407,8 +407,8 @@ curl http://localhost:3000/api/v1/tokens/whoami \
 | `maxAttempts` | int | 否 | 重试上限 1–10，默认 `3` |
 | `timeoutMs` | int | 否 | 单次超时 1000–3_600_000ms，默认 `30000` |
 | `recipients` | string[] | 否 | 终态邮件收件人；缺席/空数组=不发邮件（webhook 照发），默认 `[]` |
-| `notifyOn` | string[] | 否 | 默认 `["succeeded","failed"]` |
-| `webhookUrl` | string | 否 | 终态回调地址 |
+| `notifyOn` | string[] | 否 | 仅控制邮件，默认 `["succeeded","failed"]` |
+| `webhookUrl` | string | 否 | 终态回调地址；有即每个终态必发（不受 `notifyOn` 约束），与 `payload.url` 同规则做 SSRF 校验 |
 | `systemUserId` | string | 否 | 系统内用户标识（≤191 字符）；也可通过请求头 `X-System-User-Id` 传入 |
 | `emailSubjectTemplate` | string | 否 | 邮件标题模板（≤255），`{path}` 从响应数据取值渲染 |
 | `emailBodyTemplate` | string | 否 | 邮件正文模板（≤10000），同上 |
@@ -510,8 +510,8 @@ curl http://localhost:3000/api/v1/tasks/cmt6yqpo50003m0vispoa9p9h \
 | `payload` | object | 同创建任务 |
 | `enabled` | boolean | `false` 停用，`true` 重启用 |
 | `maxAttempts` / `timeoutMs` | int | 重试上限 / 单次超时 |
-| `recipients` / `notifyOn` | string[] | 通知配置 |
-| `webhookUrl` | string \| null | 传 `null` 清除 |
+| `recipients` / `notifyOn` | string[] | 邮件通知配置（`notifyOn` 仅控制邮件） |
+| `webhookUrl` | string \| null | 终态回调地址（有即必发）；传 `null` 清除，改地址同样经 SSRF 校验 |
 | `systemUserId` | string \| null | 可通过请求头 `X-System-User-Id` 传入，头值优先 |
 | `emailSubjectTemplate` / `emailBodyTemplate` / `emailAttachmentUrlTemplate` | string \| null | 邮件模板；传 `null` 恢复默认 |
 
@@ -621,7 +621,7 @@ curl -X POST http://localhost:3000/api/v1/tasks/preview-next-run \
 
 <Endpoint id="ep-tasks-sign-secrets" method="GET" path="/api/v1/tasks/:id/sign-secrets" name="读取签名密钥" />
 
-取回任务的出站签名密钥明文，供接收方验签。`webhookSecret`（终态 webhook 用）、`execSignSecret`（任务执行请求签名用）。无对应功能的项为 `null`。每次读取记审计。
+取回任务的出站签名密钥明文，供接收方验签。`execSignSecret`（任务执行请求签名用）；`webhookSecret` 已退场（终态 webhook 改用固定共享密钥签名），恒为 `null`。每次读取记审计。
 
 | 参数 | 位置 | 说明 |
 |------|------|------|
@@ -637,7 +637,7 @@ curl http://localhost:3000/api/v1/tasks/<task-id>/sign-secrets \
 ```json
 { "success": true, "data": {
     "taskId": "<task-id>",
-    "webhookSecret": "<64 位 hex 或 null>",
+    "webhookSecret": null,
     "execSignSecret": "<64 位 hex 或 null>"
 } }
 ```
@@ -650,22 +650,22 @@ curl http://localhost:3000/api/v1/tasks/<task-id>/sign-secrets \
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `key` | string | 是 | `webhookSecret` / `execSignSecret` |
+| `key` | string | 是 | 仅 `execSignSecret`（`webhookSecret` 已退场，传它直接 `400`） |
 
-无 `webhookUrl` 的任务转 `webhookSecret` → `400`；非 http 任务转 `execSignSecret` → `400`。
+非 http 任务转 `execSignSecret` → `400`。
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/tasks/<task-id>/sign-secrets/rotate \
   -H "x-api-token: sche-sfBnRhkMFNiXVUC2Fni6xtPLVZt0T7xhgjb3sfJs2uK3cMKt" \
   -H "Content-Type: application/json" \
-  -d '{"key":"webhookSecret"}'
+  -d '{"key":"execSignSecret"}'
 ```
 
 **成功（200）**：
 
 ```json
 { "success": true, "data": {
-    "taskId": "<task-id>", "key": "webhookSecret", "secret": "<新 64 位 hex，明文仅此一次>"
+    "taskId": "<task-id>", "key": "execSignSecret", "secret": "<新 64 位 hex，明文仅此一次>"
 } }
 ```
 
@@ -833,21 +833,22 @@ curl -X PATCH http://localhost:3000/api/v1/tasks/<task-id> \
 
 ### 7.1 Webhook 回调 <Method method="POST" /> `webhookUrl`
 
-任务到终态且 `notifyOn` 包含该状态、并配置了 `webhookUrl` 时，平台向其发起 `POST`：
+配置了 `webhookUrl` 的任务，每个终态（成功/失败，含超时与死信归一）必向其发起 `POST`——**只看 url 有无，不看 `notifyOn` / `recipients`**（后两者只控制邮件）。不配则不发。
 
 ```json
 { "runId": "exXXXX", "taskId": "tkXXXX", "taskName": "每日对账", "status": "succeeded",
   "scheduledAt": "2026-08-24T09:00:00.000+08:00", "startedAt": "2026-08-24T09:00:00.120+08:00",
-  "finishedAt": "2026-08-24T09:00:01.040+08:00", "durationMs": 920 }
+  "finishedAt": "2026-08-24T09:00:01.040+08:00", "durationMs": 920,
+  "nextRunAt": "2026-08-25T09:00:00.000+08:00", "disabledReason": null }
 ```
 
-失败时额外携带 `"error": { "message": "<错误摘要>" }`；`status` 取值 `succeeded | failed | dead`。`runId` 全局唯一，消费方应以其做幂等去重。
+失败时额外携带 `"error": { "message": "<错误摘要>" }`；`status` 取值 `succeeded | failed | dead`。`runId` 全局唯一，消费方应以其做幂等去重。`nextRunAt` 为下次触发时间（北京时间；无后续运行则 `null`，如一次性跑完或任务已停用），`disabledReason` 为停用原因（未停用则 `null`）。
 
-**验签**：请求头 `X-Scheduled-Signature: t=<unix>,v1=<hex>`。对 `t + "." + 原始请求体` 做 HMAC-SHA256，密钥为 `webhookSecret`；`t` 防重放（容忍 5 分钟），`v1` 防伪造。
+**签名**：与任务执行请求同构的固定密钥签名，请求头带两个：`X-Scheduled-Signature: t=<unix>,v1=<hex>`（对 `t + "." + 原始请求体` 做 HMAC-SHA256，密钥为服务端 `TASK_CALLBACK_SIGN_SECRET`）和 `X-Execution-Id: <runId>`（供对账）。服务端未配密钥时裸发（无签名头，与任务执行请求一致）。`t` 防重放（容忍 5 分钟），`v1` 防伪造；per-task 的 `webhookSecret` 已退场，不再按任务签发密钥。
 
 <Warn>
 
-**密钥交接**：`webhookSecret` 与 `execSignSecret` 不在 CRUD 响应中返回。用 `GET /api/v1/tasks/:id/sign-secrets` 取回明文；轮换用 `POST /api/v1/tasks/:id/sign-secrets/rotate`。轮换只影响之后入 outbox 的行——须跟接收方约同一分钟操作。
+**密钥交接**：终态 webhook 不再使用 per-task 密钥——接收方用与平台约定的固定共享密钥（`TASK_CALLBACK_SIGN_SECRET`）验签即可；`sign-secrets` 接口的 `webhookSecret` 恒为 `null`，轮换它直接 `400`。
 
 </Warn>
 
@@ -856,7 +857,7 @@ Node 验签示例：
 ```ts
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-const secret = "<webhookSecret>";
+const secret = "<TASK_CALLBACK_SIGN_SECRET>";
 const MAX_AGE_SECONDS = 300;
 
 function verify(body: string, header: string | undefined): boolean {
@@ -875,7 +876,7 @@ function verify(body: string, header: string | undefined): boolean {
 
 </Danger>
 
-投递语义：按 `runId` 幂等（同一运行只成功投递一次）；失败走指数退避自动重试；记录查 `GET /api/v1/tasks/:id/webhook-deliveries`。
+投递语义：按 `runId` 幂等（同一运行只成功投递一次）；失败走指数退避自动重试；记录查 `GET /api/v1/tasks/:id/webhook-deliveries`。`webhookUrl` 与任务 `payload.url` 走同一套 SSRF 校验（含 DNS 复核与重定向逐跳复查）。
 
 ### 7.2 邮件通知
 
@@ -884,6 +885,19 @@ function verify(body: string, header: string | undefined): boolean {
 模板上下文＝内层 `data` 字段平铺＋系统/派生字段：`statusText`（成功/失败）、`failureReason`（外层 `msg` 优先）、`previewTableHtml`（预览表格前 20 行 HTML）、`previewRowsMail`、`previewNote`、`fileSizeText`、`fileDesc`，另有中文别名（`任务名称`、`执行时间`、`执行状态`、`失败原因`、`结果总数量`、`文件格式`、`预览行数`、`预览结果表格`、`文件说明`、`文件链接`、`站内链接`）。缺值替换为空串，未知占位保留原文并打 warn 日志。
 
 失败优先用 `emailSubjectTemplateFailed` / `emailBodyTemplateFailed`（null=回退成功模板）。成败自动判定：HTTP 非 2xx 按原逻辑失败；2xx 且包体含 `code` 时仅数字 `200` 算成功，其余全失败（`msg` 作失败原因，不重试）；包体无 `code` 则成功。无模板时的默认正文仅 Run / Status / Task / Scheduled / Duration。
+
+自定义正文模板会自动美化：模板里的换行保留为换行（不再挤成一段），纯文本形态的 `{文件链接}` / `{站内链接}` 分别渲染成「下载附件」「查看详情」蓝色按钮（URL 只进链接地址；自己手写的链接不动；纯文本版保留裸链接）。推荐模板（每字段一行）：
+
+```
+任务名称：{任务名称}
+执行时间：{执行时间}
+结果总数量：{结果总数量}行
+文件格式：{文件格式}
+{预览结果表格}
+{文件说明}
+下载链接：{文件链接}
+点击查看本次执行详情：{站内链接}
+```
 
 <h2 id="envelope">8 · 响应格式与错误码</h2>
 

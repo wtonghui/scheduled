@@ -45,24 +45,38 @@ export function TaskCompleteEmail(props: TaskCompleteEmailProps) {
             maxWidth: 560,
           }}
         >
-          <Heading style={{ marginTop: 0, fontSize: 20 }}>
+          <Heading style={{ marginTop: 0, marginBottom: 12, fontSize: 20 }}>
             {icon} {taskName} — 执行{ok ? "成功" : "失败"}
           </Heading>
           <Section style={{ fontSize: 14, lineHeight: 1.7 }}>
-            <Text>
+            <Text style={{ margin: "0 0 16px" }}>
+              <span
+                style={{
+                  display: "inline-block",
+                  backgroundColor: ok ? "#16a34a" : "#dc2626",
+                  color: "#ffffff",
+                  borderRadius: 999,
+                  padding: "2px 12px",
+                  fontSize: 13,
+                }}
+              >
+                {ok ? "成功" : "失败"}
+              </span>
+            </Text>
+            <Text style={{ margin: "8px 0" }}>
               <strong>Run</strong>: <code>{runId}</code>
             </Text>
-            <Text>
+            <Text style={{ margin: "8px 0" }}>
               <strong>Status</strong>: {status}
             </Text>
-            <Text>
+            <Text style={{ margin: "8px 0" }}>
               <strong>Task</strong>: <code>{taskId}</code>
             </Text>
-            <Text>
+            <Text style={{ margin: "8px 0" }}>
               <strong>Scheduled</strong>: {scheduledAt}
             </Text>
             {durationMs != null && (
-              <Text>
+              <Text style={{ margin: "8px 0" }}>
                 <strong>Duration</strong>: {durationMs}ms
               </Text>
             )}

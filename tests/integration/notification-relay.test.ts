@@ -161,12 +161,10 @@ describe("notification relay proofs", () => {
     const outcome = await runTaskWithScheduledAt(def, new Date(), "scheduled");
     expect(outcome.status).toBe("succeeded");
 
-    // 第一轮：flaky 500 → failed（可重试），非 dead（只断言本行终态，全局计数会被同租户遗留行干扰）
-    await runWebhookRelayOnce(20);
-    const failed = await prisma.webhookDelivery.findUnique({
-      where: { runId: outcome.executionId },
-    });
-    expect(failed?.status).toBe("failed");
+    // 第一轮：flaky 500 → failed（可重试），非 dead。
+    // 轮询本行终态（文件头约定）：并行跑多文件时本行可能被别文件中继顺手认领，
+    // 单轮 relay 后断言会撞上 in_progress 中间态。
+    await waitForWebhook(outcome.executionId, "failed");
     expect(hookHits).toHaveLength(0);
 
     // 推前重试时刻 → 第二轮投递成功

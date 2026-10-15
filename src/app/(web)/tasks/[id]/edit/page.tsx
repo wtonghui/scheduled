@@ -115,6 +115,10 @@ export default function EditTaskPage() {
   }
 
   const save = async (values: TaskFormValues) => {
+    // 生效调度与后端同口径（runAt 优先）：一次任务不发重复调度专属字段，
+    // 否则命中 400（run-once takes no end rules...）。可 null 的三个显式传 null，
+    // 以便 cron→runAt 切换时清掉旧值；不可 null 的三个直接省略（保留既有）。
+    const isRunOnce = !!values.runAt;
     await api.patch<TaskDetail>(`/api/v1/tasks/${id}`, {
       name: values.name,
       cron: values.cron ?? null,
@@ -122,12 +126,16 @@ export default function EditTaskPage() {
       runAt: values.runAt ?? null,
       timezone: values.timezone ?? null,
       retryDelayMs: values.retryDelayMs ?? null,
-      ...(values.overlapPolicy ? { overlapPolicy: values.overlapPolicy } : {}),
-      endsAt: values.endsAt ?? null,
-      maxRuns: values.maxRuns ?? null,
-      startsAt: values.startsAt ?? null,
-      skipHolidays: values.skipHolidays ?? false,
-      ...(values.holidayPolicy ? { holidayPolicy: values.holidayPolicy } : {}),
+      ...(isRunOnce
+        ? { endsAt: null, maxRuns: null, startsAt: null }
+        : {
+            ...(values.overlapPolicy ? { overlapPolicy: values.overlapPolicy } : {}),
+            endsAt: values.endsAt ?? null,
+            maxRuns: values.maxRuns ?? null,
+            startsAt: values.startsAt ?? null,
+            skipHolidays: values.skipHolidays ?? false,
+            ...(values.holidayPolicy ? { holidayPolicy: values.holidayPolicy } : {}),
+          }),
       emailSubjectTemplate: values.emailSubjectTemplate ?? null,
       emailBodyTemplate: values.emailBodyTemplate ?? null,
       emailSubjectTemplateFailed: values.emailSubjectTemplateFailed ?? null,
@@ -148,6 +156,9 @@ export default function EditTaskPage() {
       notifyOn: values.notifyOn,
       webhookUrl: values.webhookUrl || null,
       ...(values.systemUserId ? { systemUserId: values.systemUserId } : {}),
+      // 编辑即重启用：停用态（一次任务跑完等）保存时自动恢复调度，
+      // 后端重启用分支会重算 nextRunAt 并清空停用三字段；已启用任务不重复传。
+      ...(!task.enabled ? { enabled: true } : {}),
       version: task.version,
     });
     toast("已保存，调度下轮轮询生效", "success");

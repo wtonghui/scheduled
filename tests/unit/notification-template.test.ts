@@ -171,6 +171,46 @@ describe("renderTaskEmail with user templates (flattened data context)", () => {
     expect(fallback.html).toContain("正文 失败");
   });
 
+  it("beautifies the recommended template: line breaks kept, file/site links become buttons", async () => {
+    const out = await renderTaskEmail(
+      {
+        ...summary,
+        result: {
+          status: 200,
+          redirects: [],
+          attempt: 1,
+          data: {
+            code: 200,
+            msg: "成功",
+            data: {
+              taskName: "每日对账",
+              executionAt: "2026-09-18 11:11:00",
+              rowCount: 1286,
+              fileType: "xlsx",
+              fileUrl: "https://minio.example.com/scheduled-task/xxx/result.xlsx",
+              viewUrl: "http://www.xxx.com/yyy/zzz",
+            },
+          },
+        },
+      },
+      {
+        subject: "【SQL定时查询】{任务名称}",
+        body: "任务名称：{任务名称}\n执行时间：{执行时间}\n结果总数量：{结果总数量}行\n文件格式：{文件格式}\n下载链接：{文件链接}\n点击查看本次执行详情：{站内链接}",
+      },
+    );
+    // 换行保留为 <br>
+    expect(out.html).toContain("任务名称：每日对账<br>执行时间：");
+    // 文件/站内链接按钮化（URL 只进 href，正文只留按钮文案）
+    expect(out.html).toContain('href="https://minio.example.com/scheduled-task/xxx/result.xlsx"');
+    expect(out.html).toContain(">下载附件</a>");
+    expect(out.html).toContain('href="http://www.xxx.com/yyy/zzz"');
+    expect(out.html).toContain(">查看详情</a>");
+    // 纯文本版保留裸 URL 与原始换行
+    expect(out.text).toContain("任务名称：每日对账\n执行时间：2026-09-18 11:11:00");
+    expect(out.text).toContain("下载链接：https://minio.example.com/scheduled-task/xxx/result.xlsx");
+    expect(out.text).toContain("点击查看本次执行详情：http://www.xxx.com/yyy/zzz");
+  });
+
   it("does not duplicate the link when the body already contains the url", async () => {
     const out = await renderTaskEmail(summary, {
       subject: "任务完成 — {rowCount} 行",
