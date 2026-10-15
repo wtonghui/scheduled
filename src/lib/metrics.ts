@@ -94,11 +94,6 @@ export const outboxPendingByTenant = new Gauge({
   labelNames: ["tenant"],
 });
 
-export const outboxHealedTotal = new Counter({
-  name: "scheduled_outbox_healed_total",
-  help: "outbox rows backfilled by the heal job",
-});
-
 export const workerHeartbeats = new Counter({
   name: "scheduled_worker_heartbeats_total",
   help: "worker heartbeats upserts",

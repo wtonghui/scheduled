@@ -7,11 +7,12 @@
 - 默认邮件正文精简：仅 Run / Status / Task / Scheduled / Duration（去 Error 行与站内链接 footer）
 - succeeded_with_results：notifyOn 新增此值，有结果数据时才发通知
 - 中继回收：认领后 10 分钟未完成的 in_progress 邮件/webhook 自动回收重投
-- webhook 判定解耦（V3）：只看有没有配 `webhookUrl`，有即每个终态必发，不再受 `notifyOn` / `recipients` 约束（后两者只控制邮件）；自愈补插同口径
+- webhook 判定解耦（V3）：只看有没有配 `webhookUrl`，有即每个终态必发，不再受 `notifyOn` / `recipients` 约束（后两者只控制邮件）
 - webhook 固定密钥签名（V3）：终态回调改用服务端 `TASK_CALLBACK_SIGN_SECRET` 签名，只发两头 `X-Scheduled-Signature` + `X-Execution-Id`（不要 `X-Trigger-Type`）；未配密钥即裸发（与任务执行请求一致）；per-task `webhookSecret` 已退场（不再生成/轮换，读恒 null）
 - webhookUrl 入参与 `payload.url` 同规则做 SSRF 校验（创建/修改时拦，投递前与重定向逐跳复查保留）
 - webhook payload 新增 `nextRunAt`（下次触发，北京时间 ISO；无后续运行为 null）与 `disabledReason`（停用原因，未停用为 null），终态写入前按任务行快照取值
 - 自定义邮件正文自动美化：模板换行保留为换行，纯文本形态的 `{文件链接}` / `{站内链接}` 分别渲染成「下载附件」「查看详情」蓝色按钮（手写链接不动；纯文本版保留裸链接）；默认模板加成功/失败状态徽标与行间距
+- 终态意图冻结审计：执行终态把“该不该发 + 用什么发的”（收件人/notifyOn/webhookUrl/模板/结果）记在 `task_execution` 上；渲染链抛错走纯字符串降级兜底（永不抛），“终态无通知行”在代码上不可能发生，故无自动补单（中继重试/stale 回收/手动 redrive 保留）
 
 ### 安全与对接
 

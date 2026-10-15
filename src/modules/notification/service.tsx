@@ -55,6 +55,63 @@ export interface RunSummary {
   result?: unknown;
 }
 
+/**
+ * 终态通知意图快照：终态时刻冻结“这次该不该发 + 用什么发的”，与任务现状解耦。
+ * 期望列当审计（事后改配置不影响旧 run 的记录）；渲染失败走降级兜底，无自动补单。
+ * 不含密钥明文（webhook V3 固定密钥，中继时读 env）。
+ */
+export interface NotifySnapshot {
+  tenantId: string;
+  taskName: string;
+  recipients: string[];
+  notifyOn: string[];
+  webhookUrl: string | null;
+  systemUserId?: string | null;
+  emailSubjectTemplate?: string | null;
+  emailBodyTemplate?: string | null;
+  emailSubjectTemplateFailed?: string | null;
+  emailBodyTemplateFailed?: string | null;
+  emailAttachmentUrlTemplate?: string | null;
+  /** ISO 字符串；null=无后续运行 */
+  nextRunAt?: string | null;
+  disabledReason?: string | null;
+  /** 执行器原始结果（模板渲染 + succeeded_with_results 已在终态判过，这里只为渲染） */
+  result?: unknown;
+}
+
+/** 终态时刻判定期望（与 prepareNotificationOutbox 门控同口径，渲染成败不影响期望）。 */
+export function notificationExpectation(
+  ctx: Pick<NotifyContext, "recipients" | "notifyOn" | "webhookUrl">,
+  statusKey: "succeeded" | "failed",
+  result?: unknown,
+): { emailExpected: boolean; webhookExpected: boolean } {
+  return {
+    emailExpected:
+      ctx.recipients.length > 0 && shouldNotifyForStatus(ctx.notifyOn, statusKey, result),
+    webhookExpected: !!ctx.webhookUrl?.trim(),
+  };
+}
+
+/** 从终态上下文组装快照（含结果与下次触发，Date 转 ISO）。 */
+export function buildNotifySnapshot(ctx: NotifyContext, summary: RunSummary): NotifySnapshot {
+  return {
+    tenantId: ctx.tenantId,
+    taskName: ctx.taskName,
+    recipients: ctx.recipients,
+    notifyOn: ctx.notifyOn,
+    webhookUrl: ctx.webhookUrl,
+    systemUserId: ctx.systemUserId ?? null,
+    emailSubjectTemplate: ctx.emailSubjectTemplate ?? null,
+    emailBodyTemplate: ctx.emailBodyTemplate ?? null,
+    emailSubjectTemplateFailed: ctx.emailSubjectTemplateFailed ?? null,
+    emailBodyTemplateFailed: ctx.emailBodyTemplateFailed ?? null,
+    emailAttachmentUrlTemplate: ctx.emailAttachmentUrlTemplate ?? null,
+    nextRunAt: ctx.nextRunAt ? ctx.nextRunAt.toISOString() : null,
+    disabledReason: ctx.disabledReason ?? null,
+    ...(summary.result !== undefined ? { result: summary.result } : {}),
+  };
+}
+
 function emailSubject(taskName: string, status: string): string {
   const ok = status === "succeeded";
   return `${ok ? "✅" : "❌"} [${taskName}] 执行${ok ? "成功" : "失败"}`;
@@ -558,167 +615,3 @@ export async function enqueueNotificationsFromRun(
   }
 }
 
-/** 自愈窗口：只补最近 7 天终态，避免给几个月前的历史补发骚扰。 */
-const HEAL_WINDOW_MS = 7 * 24 * 3600 * 1000;
-/** 单轮自愈上限：heal 是兜底慢通道，不跟正常中继抢池。 */
-const HEAL_BATCH = 50;
-
-/**
- * 历史坏账自愈（第2项吞错时代+极端渲染失败残留）：
- * 扫最近 7 天终态执行，缺 outbox 行 → 按 run_id 幂等补插。
- * `succeeded_with_results` 因缺执行结果上下文无法准确判定，跳过（宁漏勿错，发了多余通知更糟）。
- * @returns 补插的行数
- */
-export async function healMissingOutbox(limit = HEAL_BATCH): Promise<number> {
-  const since = new Date(Date.now() - HEAL_WINDOW_MS);
-  const runs = await prisma.taskExecution.findMany({
-    where: {
-      status: { in: ["succeeded", "failed", "dead", "timeout"] },
-      finishedAt: { gte: since },
-    },
-    orderBy: { finishedAt: "desc" },
-    take: limit,
-    select: {
-      id: true,
-      taskId: true,
-      status: true,
-      scheduledAt: true,
-      startedAt: true,
-      finishedAt: true,
-      durationMs: true,
-      error: true,
-    },
-  });
-  let healed = 0;
-  for (const run of runs) {
-    const task = await prisma.task.findUnique({
-      where: { id: run.taskId },
-      select: {
-        id: true,
-        name: true,
-        tenantId: true,
-        recipients: true,
-        notifyOn: true,
-        webhookUrl: true,
-        webhookSecret: true,
-        nextRunAt: true,
-        disabledReason: true,
-        systemUserId: true,
-        emailSubjectTemplate: true,
-        emailBodyTemplate: true,
-        emailSubjectTemplateFailed: true,
-        emailBodyTemplateFailed: true,
-        emailAttachmentUrlTemplate: true,
-      },
-    });
-    if (!task) {
-      continue;
-    }
-    const notifyOn = (task.notifyOn as string[]) ?? [];
-    const recipients = (task.recipients as string[]) ?? [];
-    // Webhook V3：自愈同样只看 webhookUrl；邮件仍走 notifyOn（含 succeeded_with_results 跳过逻辑见下）
-    const needWebhook = !!task.webhookUrl?.trim();
-    const plainOk =
-      run.status === "succeeded" ? notifyOn.includes("succeeded") : notifyOn.includes("failed");
-    const needEmail = recipients.length > 0 && plainOk;
-    if (!needEmail && !needWebhook) {
-      continue;
-    }
-    const [hasEmail, hasWebhook] = await Promise.all([
-      needEmail
-        ? prisma.emailLog.findUnique({ where: { runId: run.id }, select: { id: true } })
-        : Promise.resolve(true),
-      needWebhook
-        ? prisma.webhookDelivery.findUnique({ where: { runId: run.id }, select: { id: true } })
-        : Promise.resolve(true),
-    ]);
-    if (hasEmail && hasWebhook) {
-      continue;
-    }
-    const errObj = run.error as { message?: unknown } | null;
-    const ctx: NotifyContext = {
-      tenantId: task.tenantId,
-      taskId: task.id,
-      taskName: task.name,
-      recipients,
-      notifyOn,
-      webhookUrl: task.webhookUrl,
-      nextRunAt: task.nextRunAt ?? null,
-      disabledReason: task.disabledReason ?? null,
-      webhookSecretBytes: task.webhookSecret ? new Uint8Array(task.webhookSecret) : null,
-      systemUserId: task.systemUserId,
-      emailSubjectTemplate: task.emailSubjectTemplate,
-      emailBodyTemplate: task.emailBodyTemplate,
-      emailSubjectTemplateFailed: task.emailSubjectTemplateFailed,
-      emailBodyTemplateFailed: task.emailBodyTemplateFailed,
-      emailAttachmentUrlTemplate: task.emailAttachmentUrlTemplate,
-    };
-    const summary: RunSummary = {
-      executionId: run.id,
-      taskId: task.id,
-      taskName: task.name,
-      status: run.status === "succeeded" ? "succeeded" : "failed",
-      scheduledAt: run.scheduledAt,
-      startedAt: run.startedAt,
-      finishedAt: run.finishedAt,
-      durationMs: run.durationMs,
-      errorMessage: typeof errObj?.message === "string" ? errObj.message : null,
-    };
-    let prepared: PreparedOutbox | null;
-    try {
-      prepared = await prepareNotificationOutbox(ctx, summary);
-    } catch (error) {
-      logger.error(
-        { err: (error as Error).message, runId: run.id },
-        "heal render failed, skipping run",
-      );
-      continue;
-    }
-    if (!prepared) {
-      continue;
-    }
-    try {
-      if (needEmail && !hasEmail && prepared.email) {
-        await prisma.emailLog.create({
-          data: {
-            runId: run.id,
-            taskId: task.id,
-            tenantId: task.tenantId,
-            toAddress: prepared.email.toAddress,
-            subject: prepared.email.subject,
-            html: prepared.email.html,
-            text: prepared.email.text,
-            attachmentUrl: prepared.email.attachmentUrl,
-            status: "pending",
-            maxAttempts: 5,
-            ...(task.systemUserId ? { systemUserId: task.systemUserId } : {}),
-          },
-        });
-        healed += 1;
-      }
-      if (needWebhook && !hasWebhook && prepared.webhook) {
-        await prisma.webhookDelivery.create({
-          data: {
-            runId: run.id,
-            tenantId: task.tenantId,
-            webhookUrl: prepared.webhook.url,
-            payload: prepared.webhook.payload,
-            webhookSecret: ctx.webhookSecretBytes
-              ? new Uint8Array(ctx.webhookSecretBytes)
-              : null,
-            status: "pending",
-            maxAttempts: 5,
-            ...(task.systemUserId ? { systemUserId: task.systemUserId } : {}),
-          },
-        });
-        healed += 1;
-      }
-    } catch (error) {
-      if ((error as { code?: string }).code === "P2002") {
-        continue;
-      }
-      logger.warn({ err: (error as Error).message, runId: run.id }, "heal backfill failed");
-    }
-  }
-  return healed;
-}

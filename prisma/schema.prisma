@@ -123,6 +123,9 @@ model TaskExecution {
   error             Json?
   trigger           String            @db.VarChar(16)
   systemUserId     String?           @map("system_user_id") @db.VarChar(191) // 系统内用户标识
+  emailExpected     Boolean           @default(false) @map("email_expected") // 终态时刻判定：这次该不该发邮件（审计用；渲染失败走降级兜底，无自动补单）
+  webhookExpected   Boolean           @default(false) @map("webhook_expected") // 终态时刻判定：这次该不该推 webhook
+  notifySnapshot    Json?             @map("notify_snapshot") // 通知渲染快照（收件人/模板/webhookUrl/结果等，不含密钥明文）
   createdAt         DateTime          @default(now()) @map("created_at") @db.DateTime(6)
   task              Task              @relation(fields: [taskId], references: [id], onDelete: Cascade)
   emailLogs         EmailLog[]

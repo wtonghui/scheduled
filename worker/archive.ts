@@ -107,6 +107,9 @@ const EXECUTION_COLS = [
   "error",
   "`trigger`",
   "system_user_id",
+  "email_expected",
+  "webhook_expected",
+  "notify_snapshot",
   "created_at",
 ].join(", ");
 

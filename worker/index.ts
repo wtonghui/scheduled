@@ -3,8 +3,7 @@ import os from "node:os";
 import { config } from "../src/lib/config";
 import { prisma } from "../src/lib/db";
 import { logger } from "../src/lib/logger";
-import { outboxDead, outboxFailed, outboxHealedTotal, outboxPending, outboxPendingByTenant, workerHeartbeats } from "../src/lib/metrics";
-import { healMissingOutbox } from "../src/modules/notification/service";
+import { outboxDead, outboxFailed, outboxPending, outboxPendingByTenant, workerHeartbeats } from "../src/lib/metrics";
 import { registerDefaultExecutors } from "../src/modules/execution/register";
 import { runArchiveOnce } from "./archive";
 import { runEmailRelayOnce } from "./relay";
@@ -73,20 +72,6 @@ async function heartbeat(): Promise<void> {
     // 孤儿对账：死 worker 遗留 running → failed（不重跑，防双副作用）；清过期认领
     await reconcileOrphanExecutions();
 
-    // 历史坏账自愈：终态缺 outbox 行 → 幂等补插；慢通道 60s 一次，不跟每次心跳
-    if (Date.now() - lastHealAt > HEAL_INTERVAL_MS) {
-      lastHealAt = Date.now();
-      try {
-        const healed = await healMissingOutbox();
-        if (healed > 0) {
-          outboxHealedTotal.inc(healed);
-          logger.warn({ healed }, "healed missing outbox rows");
-        }
-      } catch (error) {
-        logger.warn({ err: (error as Error).message }, "heal missing outbox failed");
-      }
-    }
-
     // retention 归档：超期终态搬进 *_archive；慢通道 24h 一次（多 pod 各跑各的，分片幂等收敛）
     if (Date.now() - lastArchiveAt > ARCHIVE_INTERVAL_MS) {
       lastArchiveAt = Date.now();
@@ -104,10 +89,6 @@ async function heartbeat(): Promise<void> {
     logger.warn({ err: (error as Error).message }, "heartbeat failed");
   }
 }
-
-/** 自愈节流：慢通道 60s 一次。 */
-const HEAL_INTERVAL_MS = 60_000;
-let lastHealAt = 0;
 
 /** 归档节流：慢通道 24h 一次。 */
 const ARCHIVE_INTERVAL_MS = 24 * 3600 * 1000;

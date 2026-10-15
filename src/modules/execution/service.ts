@@ -1,5 +1,6 @@
 import { withTimeout } from "@/lib/concurrency";
 import { prisma } from "@/lib/db";
+import { toBeijingIso } from "@/lib/datetime";
 import { HttpError, TimeoutError } from "@/lib/errors";
 import { logger } from "@/lib/logger";
 import {
@@ -12,10 +13,14 @@ import {
 import { classifyError, computeRetryDelayMs } from "@/lib/retry";
 import {
   type NotifyContext,
+  type PreparedOutbox,
   type RunSummary,
+  buildNotifySnapshot,
+  notificationExpectation,
   prepareNotificationOutbox,
   writePreparedOutbox,
 } from "@/modules/notification/service";
+import { buildWebhookPayload } from "@/modules/webhook/service";
 import type { Prisma } from "@prisma/client";
 import { type TaskExecutorInput, getExecutor } from "./registry";
 
@@ -149,6 +154,80 @@ interface FinalizeFields {
   error?: Prisma.InputJsonValue;
 }
 
+/** 纯字符串 HTML 转义（降级通知用，不依赖任何渲染引擎）。 */
+function escapeDegradedHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * 降级通知（永不抛）：正常渲染链（React Email / 模板引擎）抛到外层时用它兜底，
+ * 只做纯字符串拼接，保证“该发就有行”——“终态无 outbox”在代码上不可能发生。
+ * 附件固定 null（只保到达，中继不下载）。
+ */
+export function buildDegradedOutbox(
+  notifyCtx: NotifyContext,
+  summary: RunSummary,
+  fields: FinalizeFields,
+  errorMessage: string | null,
+  emailExpected: boolean,
+  webhookExpected: boolean,
+): PreparedOutbox {
+  const out: PreparedOutbox = {};
+  if (emailExpected) {
+    const ok = fields.status === "succeeded";
+    const subject = `${ok ? "✅" : "❌"} [${String(summary.taskName)}] 执行${ok ? "成功" : "失败"}（降级通知）`;
+    const lines = [
+      `Task: ${String(summary.taskId)} (${String(notifyCtx.taskName)})`,
+      `Run: ${String(summary.executionId)}`,
+      `Status: ${String(fields.status)}`,
+      `Scheduled: ${summary.scheduledAt.toISOString()}`,
+      `Finished: ${fields.finishedAt.toISOString()}`,
+      `Duration: ${String(fields.durationMs)}ms`,
+      ...(errorMessage ? [`Error: ${errorMessage}`] : []),
+      "说明：完整模板渲染失败，此为降级通知，详情请查执行记录。",
+    ];
+    const text = lines.join("\n");
+    const html = `<div>${lines.map((l) => escapeDegradedHtml(l)).join("<br>")}</div>`;
+    out.email = {
+      toAddress: JSON.stringify(notifyCtx.recipients),
+      subject,
+      html,
+      text,
+      attachmentUrl: null,
+    };
+  }
+  if (webhookExpected && notifyCtx.webhookUrl) {
+    let payload: Prisma.InputJsonValue;
+    try {
+      payload = buildWebhookPayload({
+        runId: summary.executionId,
+        taskId: summary.taskId,
+        taskName: summary.taskName,
+        status: summary.status,
+        scheduledAt: toBeijingIso(summary.scheduledAt),
+        startedAt: summary.startedAt ? toBeijingIso(summary.startedAt) : null,
+        finishedAt: toBeijingIso(fields.finishedAt),
+        durationMs: fields.durationMs,
+        nextRunAt: notifyCtx.nextRunAt ? toBeijingIso(notifyCtx.nextRunAt) : null,
+        disabledReason: notifyCtx.disabledReason ?? null,
+        ...(errorMessage ? { error: { message: errorMessage } } : {}),
+      }) as Prisma.InputJsonValue;
+    } catch {
+      // 时间格式化极端失败时的最后底线：裸字符串载荷，总能 JSON 化
+      payload = {
+        runId: String(summary.executionId),
+        taskId: String(summary.taskId),
+        taskName: String(summary.taskName),
+        status: String(summary.status),
+        degraded: true,
+        ...(errorMessage ? { error: { message: String(errorMessage) } } : {}),
+      } as Prisma.InputJsonValue;
+    }
+    out.webhook = { url: notifyCtx.webhookUrl, payload };
+  }
+  return out;
+}
+
 /** 终态更新 + 通知 outbox 同一事务（run_id 唯一幂等）。渲染在事务外，DB 瞬时冲突退避重试。 */
 async function finalizeExecution(
   executionId: string,
@@ -193,16 +272,34 @@ async function finalizeExecution(
     .catch(() => null);
   notifyCtx.nextRunAt = taskState?.nextRunAt ?? null;
   notifyCtx.disabledReason = taskState?.disabledReason ?? null;
-  // 事务外预渲染：CPU 活不持 DB 锁；模板坏了只记日志不阻塞终态
-  let prepared = null;
+  // 终态意图冻结：按当时的 ctx + 结果判定这次该不该发（与 prepare 门控同口径），
+  // 与任务事后改配置解耦，期望列同时当审计。
+  const statusKey = fields.status === "succeeded" ? "succeeded" : "failed";
+  const { emailExpected, webhookExpected } = notificationExpectation(
+    notifyCtx,
+    statusKey,
+    executorResult,
+  );
+  const notifySnapshot = buildNotifySnapshot(notifyCtx, summary) as unknown as Prisma.InputJsonValue;
+  // 事务外预渲染：CPU 活不持 DB 锁；正常渲染抛到外层时用纯字符串降级兜底
+  // （永不抛），保证 emailExpected/webhookExpected=true 就一定有行——
+  // “终态无 outbox”在代码上不可能发生（渲染失败走上面降级，DB 失败则事务回滚终态也不落）。
+  let prepared: PreparedOutbox | null = null;
   try {
     prepared = await prepareNotificationOutbox(notifyCtx, summary);
   } catch (error) {
     logger.error(
       { err: (error as Error).message, execution_id: executionId },
-      "notification render failed, finalizing without outbox",
+      "notification render failed, using degraded fallback",
     );
-    prepared = null;
+    prepared = buildDegradedOutbox(
+      notifyCtx,
+      summary,
+      fields,
+      errorMessage,
+      emailExpected,
+      webhookExpected,
+    );
   }
   // 瞬时 DB 冲突（P2034/P2028）退避重试 3 次，防抖动丢终态
   let lastError: unknown = null;
@@ -218,6 +315,9 @@ async function finalizeExecution(
             finishedAt: fields.finishedAt,
             durationMs: fields.durationMs,
             ...(fields.error !== undefined ? { error: fields.error } : {}),
+            emailExpected,
+            webhookExpected,
+            notifySnapshot,
           },
         });
         try {
